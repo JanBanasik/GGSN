@@ -1,0 +1,6 @@
+polars
+torch
+transformers
+torch-geometric
+pandas
+scikit-learn
