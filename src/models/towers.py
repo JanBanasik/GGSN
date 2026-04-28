@@ -1,11 +1,11 @@
 """
 Two-Tower Architecture for Multimodal Contrastive Pre-training.
 
-TextTower  – Bio_ClinicalBERT → [CLS] → Linear → L2-norm → embed_dim
-SignalTower – 1D CNN → GlobalAvgPool → Linear → L2-norm → embed_dim
+TextTower   – Bio_ClinicalBERT → [CLS] → Linear → L2-norm → embed_dim
+SignalTower – nn.Embedding(item_type) ⊕ value → 1D CNN → GAP → Linear → L2-norm
 
-Both towers output L2-normalised vectors of identical dimensionality (EMBED_DIM),
-which is required for the InfoNCE / NT-Xent loss used in Phase 1.
+Both towers output L2-normalised vectors of identical EMBED_DIM, required for
+the InfoNCE / NT-Xent loss used in Phase 1.
 """
 
 from __future__ import annotations
@@ -15,9 +15,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
 
-# Shared embedding dimension – change here to affect both towers at once.
 EMBED_DIM = 128
 BERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
+
+# Defaults aligned with the 14-signal catalog in src/data_prep/extractor.py.
+NUM_SIGNAL_TYPES = 14
+TYPE_EMBED_DIM = 8
+PAD_TYPE_ID = 0  # padding uses item_type_id=0 with value=0; mask handled implicitly
 
 
 # ---------------------------------------------------------------------------
@@ -25,14 +29,7 @@ BERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
 # ---------------------------------------------------------------------------
 class TextTower(nn.Module):
     """
-    Encodes clinical text via Bio_ClinicalBERT.
-
-    Forward input:
-        input_ids       (B, L) – token ids, L ≤ 512
-        attention_mask  (B, L) – 1 for real tokens, 0 for padding
-
-    Forward output:
-        (B, embed_dim) L2-normalised embedding derived from [CLS] token.
+    Bio_ClinicalBERT [CLS] → projection head → L2-normalised (B, embed_dim).
     """
 
     def __init__(
@@ -40,28 +37,37 @@ class TextTower(nn.Module):
         model_name: str = BERT_MODEL,
         embed_dim: int = EMBED_DIM,
         freeze_bert: bool = False,
+        freeze_bottom_layers: int = 0,
+        proj_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
         bert_hidden = self.bert.config.hidden_size  # 768 for BERT-base
 
-        # Projection head: BERT hidden → embed_dim with a bottleneck
         self.proj = nn.Sequential(
             nn.Linear(bert_hidden, bert_hidden // 2),
             nn.GELU(),
             nn.LayerNorm(bert_hidden // 2),
+            nn.Dropout(proj_dropout),
             nn.Linear(bert_hidden // 2, embed_dim),
         )
 
         if freeze_bert:
             for param in self.bert.parameters():
                 param.requires_grad = False
+        elif freeze_bottom_layers > 0:
+            # Freeze embeddings + first N transformer layers (out of 12 for BERT-base)
+            for param in self.bert.embeddings.parameters():
+                param.requires_grad = False
+            for layer in self.bert.encoder.layer[:freeze_bottom_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls = out.last_hidden_state[:, 0, :]   # (B, 768) – [CLS] representation
-        projected = self.proj(cls)              # (B, embed_dim)
-        return F.normalize(projected, dim=-1)  # L2 normalise
+        cls = out.last_hidden_state[:, 0, :]   # (B, 768)
+        projected = self.proj(cls)
+        return F.normalize(projected, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +75,13 @@ class TextTower(nn.Module):
 # ---------------------------------------------------------------------------
 class SignalTower(nn.Module):
     """
-    Encodes a variable-length sequence of (item_type, normalised_value) vitals
-    using 1-D convolutions followed by global average pooling.
+    Encodes a sequence of (item_type_id, normalised_value) clinical events.
 
-    Input shape expected:  (B, seq_len, 2)
-        channel 0 – item type encoded as float in {0.0, 1.0}  (HR=0, BP=1)
-        channel 1 – normalised measurement value in [0, 1]
-
-    Conv1d works on (B, C, L), so the sequence axis is transposed internally.
+    Forward inputs:
+        item_ids: (B, seq_len) long, values in [0, num_item_types)
+        values:   (B, seq_len) float in [0, 1]
+        mask:     (B, seq_len) float, 1 for real events, 0 for padding
+                  (optional — used to zero out padded positions before pooling)
 
     Forward output:
         (B, embed_dim) L2-normalised embedding.
@@ -84,26 +89,25 @@ class SignalTower(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 2,
+        num_item_types: int = NUM_SIGNAL_TYPES,
+        type_embed_dim: int = TYPE_EMBED_DIM,
         embed_dim: int = EMBED_DIM,
     ) -> None:
         super().__init__()
 
+        self.type_embed = nn.Embedding(num_item_types, type_embed_dim)
+
+        in_channels = type_embed_dim + 1  # type_embed concatenated with scalar value
         self.encoder = nn.Sequential(
-            # Block 1 – local patterns (kernel=3)
             nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            # Block 2 – wider receptive field (kernel=5)
             nn.Conv1d(64, 128, kernel_size=5, padding=2),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            # Block 3
             nn.Conv1d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            # Global average pooling → fixed-size regardless of seq_len
-            nn.AdaptiveAvgPool1d(1),
         )
 
         self.proj = nn.Sequential(
@@ -111,9 +115,25 @@ class SignalTower(nn.Module):
             nn.LayerNorm(embed_dim),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, seq_len, 2) → (B, 2, seq_len) for Conv1d
-        x = x.transpose(1, 2)
-        features = self.encoder(x).squeeze(-1)  # (B, 128)
-        projected = self.proj(features)          # (B, embed_dim)
-        return F.normalize(projected, dim=-1)   # L2 normalise
+    def forward(
+        self,
+        item_ids: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        type_emb = self.type_embed(item_ids)                      # (B, L, type_embed_dim)
+        x = torch.cat([type_emb, values.unsqueeze(-1)], dim=-1)   # (B, L, type_embed_dim+1)
+        x = x.transpose(1, 2)                                      # (B, C, L)
+        h = self.encoder(x)                                        # (B, 128, L)
+
+        if mask is not None:
+            # Mask out padded positions before pooling
+            m = mask.unsqueeze(1)                                  # (B, 1, L)
+            h = h * m
+            denom = m.sum(dim=-1).clamp(min=1.0)                   # (B, 1)
+            pooled = h.sum(dim=-1) / denom                         # (B, 128)
+        else:
+            pooled = h.mean(dim=-1)                                # (B, 128)
+
+        projected = self.proj(pooled)                              # (B, embed_dim)
+        return F.normalize(projected, dim=-1)

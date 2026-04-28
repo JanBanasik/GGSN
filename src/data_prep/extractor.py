@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import polars as pl
+
+from src.data_prep.cleaner import filter_leakage_phrases
 
 # ---------------------------------------------------------------------------
 # Config – hard-coded paths to raw MIMIC-IV data
@@ -23,21 +26,77 @@ CARDIO_UNITS = [
     "Coronary Care Unit (CCU)",
     "Cardiovascular Intensive Care Unit (CVICU)",
 ]
-# Heart Rate (220045), Non-Invasive Blood Pressure mean (220181)
-VITAL_ITEM_IDS = [220045, 220181]
+
+# ---------------------------------------------------------------------------
+# Signal catalog – 7 vitals + 7 labs, mapped to a contiguous item_type_id
+# ---------------------------------------------------------------------------
+# Vitals (icu/chartevents). Mean values where multiple variants exist.
+VITALS_CATALOG: dict[str, list[int]] = {
+    "HR":         [220045],            # Heart Rate
+    "BP_mean":    [220181, 220052],    # NIBP mean (preferred), Art mean (fallback)
+    "BP_sys":     [220179, 220050],
+    "BP_dia":     [220180, 220051],
+    "SpO2":       [220277],
+    "RR":         [220210],
+    "Temp_F":     [223761],
+}
+
+# Labs (hosp/labevents). Use most common itemid for each label.
+LABS_CATALOG: dict[str, list[int]] = {
+    "Troponin_I": [51002],
+    "NTproBNP":   [50963],
+    "Creatinine": [50912],
+    "Lactate":    [50813],
+    "Potassium":  [50971],
+    "Hemoglobin": [51222],
+    "WBC":        [51301],
+}
+
+# Build signal_type → item_type_id mapping (vitals first, then labs)
+ALL_SIGNAL_NAMES = list(VITALS_CATALOG.keys()) + list(LABS_CATALOG.keys())
+SIGNAL_NAME_TO_ID: dict[str, int] = {name: idx for idx, name in enumerate(ALL_SIGNAL_NAMES)}
+
+# Reverse map: itemid → signal_name (only first match wins; preferred itemid first)
+ITEMID_TO_SIGNAL: dict[int, str] = {}
+for _name, _ids in {**VITALS_CATALOG, **LABS_CATALOG}.items():
+    for _id in _ids:
+        ITEMID_TO_SIGNAL.setdefault(_id, _name)
+
+ALL_VITAL_ITEMIDS: list[int] = sorted({i for ids in VITALS_CATALOG.values() for i in ids})
+ALL_LAB_ITEMIDS: list[int] = sorted({i for ids in LABS_CATALOG.values() for i in ids})
+
+# Plausible physiological ranges for clipping (lo, hi) per signal name.
+# Used to compute normalized value ∈ [0, 1].
+NORM_RANGE: dict[str, tuple[float, float]] = {
+    "HR":         (30.0, 250.0),
+    "BP_mean":    (20.0, 200.0),
+    "BP_sys":     (40.0, 250.0),
+    "BP_dia":     (20.0, 150.0),
+    "SpO2":       (50.0, 100.0),
+    "RR":         (4.0, 60.0),
+    "Temp_F":     (90.0, 108.0),
+    "Troponin_I": (0.0, 50.0),
+    "NTproBNP":   (0.0, 35000.0),
+    "Creatinine": (0.1, 15.0),
+    "Lactate":    (0.2, 20.0),
+    "Potassium":  (1.5, 8.0),
+    "Hemoglobin": (4.0, 20.0),
+    "WBC":        (0.5, 100.0),
+}
 
 _DT_FMT = "%Y-%m-%d %H:%M:%S"
 
 
 # ---------------------------------------------------------------------------
-# Step 1 – Cardio cohort + mortality label
+# Step 1 – Cardio cohort + in-hospital mortality label
 # ---------------------------------------------------------------------------
 def load_cohort() -> pl.DataFrame:
     """
-    Loads ICU stays for CCU/CVICU units and joins a binary mortality label
-    derived from the patients.dod column.
+    Loads ICU stays for CCU/CVICU and joins in-hospital mortality from
+    `admissions.hospital_expire_flag` (true in-hospital death indicator).
 
-    Returns a small collected DataFrame (only cardio stays).
+    Returns columns:
+        subject_id, hadm_id, stay_id, first_careunit, intime, outtime, mortality
     """
     icustays_lf = (
         pl.scan_csv(MIMIC_BASE / "icu" / "icustays.csv.gz")
@@ -49,28 +108,33 @@ def load_cohort() -> pl.DataFrame:
         .select(["subject_id", "hadm_id", "stay_id", "first_careunit", "intime", "outtime"])
     )
 
-    patients_lf = (
-        pl.scan_csv(MIMIC_BASE / "hosp" / "patients.csv.gz")
-        .select(["subject_id", "dod"])
+    admissions_lf = (
+        pl.scan_csv(MIMIC_BASE / "hosp" / "admissions.csv.gz")
+        .select(["hadm_id", "deathtime", "dischtime", "hospital_expire_flag"])
         .with_columns(
-            pl.when(pl.col("dod").is_not_null())
-            .then(pl.lit(1, dtype=pl.Int8))
-            .otherwise(pl.lit(0, dtype=pl.Int8))
-            .alias("mortality")
+            pl.col("deathtime").str.to_datetime(_DT_FMT, strict=False),
+            pl.col("dischtime").str.to_datetime(_DT_FMT, strict=False),
+            pl.col("hospital_expire_flag").cast(pl.Int8),
         )
-        .drop("dod")
     )
 
     cohort = (
         icustays_lf
-        .join(patients_lf, on="subject_id", how="left")
-        .with_columns(pl.col("mortality").fill_null(pl.lit(0, dtype=pl.Int8)))
+        .join(admissions_lf, on="hadm_id", how="left")
+        .with_columns(
+            pl.col("hospital_expire_flag").fill_null(0).alias("mortality")
+        )
+        .select(
+            ["subject_id", "hadm_id", "stay_id", "first_careunit",
+             "intime", "outtime", "deathtime", "dischtime", "mortality"]
+        )
         .collect()
     )
 
     print(
         f"  Cohort: {len(cohort)} stays | "
-        f"mortality rate: {cohort['mortality'].mean():.1%}"
+        f"mortality rate (in-hospital): {cohort['mortality'].mean():.1%} | "
+        f"unique subjects: {cohort['subject_id'].n_unique()}"
     )
     return cohort
 
@@ -80,20 +144,17 @@ def load_cohort() -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 def load_notes(cohort: pl.DataFrame) -> pl.DataFrame:
     """
-    Reads radiology.csv.gz and keeps only notes whose charttime falls within
-    [intime, intime + 24h] for the matched ICU stay.  Join key: hadm_id.
+    Reads radiology.csv.gz, keeps notes within [intime, intime + 24h] for the
+    matched ICU stay, and filters out leakage phrases (see cleaner.py).
 
-    Returns a collected DataFrame with columns:
-        note_id, stay_id, note_time, text
+    Returns columns: note_id, stay_id, note_time, text
     """
     stay_times = cohort.select(["hadm_id", "stay_id", "intime"]).lazy()
 
     notes = (
         pl.scan_csv(NOTES_BASE / "note" / "radiology.csv.gz", quote_char='"')
         .select(["note_id", "subject_id", "hadm_id", "charttime", "text"])
-        .with_columns(
-            pl.col("charttime").str.to_datetime(_DT_FMT, strict=False)
-        )
+        .with_columns(pl.col("charttime").str.to_datetime(_DT_FMT, strict=False))
         .join(stay_times, on="hadm_id", how="inner")
         .filter(
             (pl.col("charttime") >= pl.col("intime"))
@@ -104,116 +165,214 @@ def load_notes(cohort: pl.DataFrame) -> pl.DataFrame:
         .collect()
     )
 
-    print(f"  Notes: {len(notes)} rows across {notes['stay_id'].n_unique()} stays")
+    print(f"  Notes (raw): {len(notes)} rows across {notes['stay_id'].n_unique()} stays")
+    notes = filter_leakage_phrases(notes, text_col="text")
+    print(f"  Notes (post-cleaner): {len(notes)} rows across {notes['stay_id'].n_unique()} stays")
     return notes
 
 
 # ---------------------------------------------------------------------------
-# Step 3 – Vitals from chartevents  (huge file – always use scan_csv!)
+# Step 3a – Vitals (chartevents)
 # ---------------------------------------------------------------------------
 def load_vitals(cohort: pl.DataFrame) -> pl.DataFrame:
     """
-    Lazily scans chartevents.csv.gz, keeps Heart Rate (220045) and
-    Non-Invasive Blood Pressure mean (220181), restricted to cohort stay_ids.
+    Lazily scans chartevents.csv.gz for the configured vital itemids,
+    restricted to cohort stay_ids and the [intime, intime+24h] window.
 
-    Returns a collected DataFrame with columns:
-        stay_id, vital_time, itemid, valuenum
+    Returns columns: stay_id, event_time, signal_name, valuenum
     """
-    valid_stay_ids = cohort.select("stay_id")
+    stay_window = cohort.select(["stay_id", "intime"]).lazy()
+    itemid_lookup = pl.LazyFrame({
+        "itemid": list(ITEMID_TO_SIGNAL.keys()),
+        "signal_name": list(ITEMID_TO_SIGNAL.values()),
+    })
 
     vitals = (
         pl.scan_csv(MIMIC_BASE / "icu" / "chartevents.csv.gz")
-        .filter(pl.col("itemid").is_in(VITAL_ITEM_IDS))
+        .filter(pl.col("itemid").is_in(ALL_VITAL_ITEMIDS))
         .select(["stay_id", "charttime", "itemid", "valuenum"])
         .with_columns(
             pl.col("charttime").str.to_datetime(_DT_FMT, strict=False),
             pl.col("valuenum").cast(pl.Float32, strict=False),
         )
-        .join(valid_stay_ids.lazy(), on="stay_id", how="inner")
+        .join(stay_window, on="stay_id", how="inner")
+        .filter(
+            (pl.col("charttime") >= pl.col("intime"))
+            & (pl.col("charttime") <= pl.col("intime") + pl.duration(hours=24))
+        )
         .drop_nulls("valuenum")
-        .rename({"charttime": "vital_time"})
+        .join(itemid_lookup, on="itemid", how="inner")
+        .rename({"charttime": "event_time"})
+        .select(["stay_id", "event_time", "signal_name", "valuenum"])
         .collect()
     )
 
     print(
         f"  Vitals: {len(vitals)} rows | "
-        f"items found: {sorted(vitals['itemid'].unique().to_list())}"
+        f"signals: {sorted(vitals['signal_name'].unique().to_list())}"
     )
     return vitals
 
 
 # ---------------------------------------------------------------------------
-# Step 4 – Pair each note with vitals within ±2 h
+# Step 3b – Labs (labevents)
 # ---------------------------------------------------------------------------
-def pair_notes_vitals(notes: pl.DataFrame, vitals: pl.DataFrame) -> pl.DataFrame:
+def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
     """
-    For every note, finds all vitals from the same stay_id whose vital_time
+    Lazily scans labevents.csv.gz for the configured lab itemids, restricted
+    to the cohort's hadm_id list and the [intime, intime+24h] window.
+
+    Lab events are joined on hadm_id (not stay_id, since labs aren't ICU-scoped).
+    The intime window filter is applied via stay_window join.
+
+    Returns columns: stay_id, event_time, signal_name, valuenum
+    """
+    stay_window = cohort.select(["hadm_id", "stay_id", "intime"]).lazy()
+    itemid_lookup = pl.LazyFrame({
+        "itemid": list(ITEMID_TO_SIGNAL.keys()),
+        "signal_name": list(ITEMID_TO_SIGNAL.values()),
+    })
+
+    labs = (
+        pl.scan_csv(MIMIC_BASE / "hosp" / "labevents.csv.gz")
+        .filter(pl.col("itemid").is_in(ALL_LAB_ITEMIDS))
+        .select(["hadm_id", "charttime", "itemid", "valuenum"])
+        .with_columns(
+            pl.col("hadm_id").cast(pl.Int64, strict=False),
+            pl.col("charttime").str.to_datetime(_DT_FMT, strict=False),
+            pl.col("valuenum").cast(pl.Float32, strict=False),
+        )
+        .drop_nulls(["hadm_id", "valuenum"])
+        .join(stay_window, on="hadm_id", how="inner")
+        .filter(
+            (pl.col("charttime") >= pl.col("intime"))
+            & (pl.col("charttime") <= pl.col("intime") + pl.duration(hours=24))
+        )
+        .join(itemid_lookup, on="itemid", how="inner")
+        .rename({"charttime": "event_time"})
+        .select(["stay_id", "event_time", "signal_name", "valuenum"])
+        .collect()
+    )
+
+    print(
+        f"  Labs: {len(labs)} rows | "
+        f"signals: {sorted(labs['signal_name'].unique().to_list())}"
+    )
+    return labs
+
+
+# ---------------------------------------------------------------------------
+# Step 4 – Pair each note with all signals within ±2 h
+# ---------------------------------------------------------------------------
+def pair_notes_signals(notes: pl.DataFrame, signals: pl.DataFrame) -> pl.DataFrame:
+    """
+    For every note, finds all signals from the same stay_id whose event_time
     lies within ±2 hours of the note_time.
 
-    Strategy: join on stay_id (one-to-many), then filter by time delta.
-    Both inputs are already small (post-cohort filtering), so the cross-join
-    per stay is memory-safe.
-
-    Returns a DataFrame with one row per (note, vital) pair.
+    Returns one row per (note, signal) pair with normalized value and
+    item_type_id (0..N_signals-1).
     """
     paired = (
-        notes.join(vitals, on="stay_id", how="inner")
+        notes.join(signals, on="stay_id", how="inner")
         .filter(
-            (pl.col("vital_time") - pl.col("note_time"))
+            (pl.col("event_time") - pl.col("note_time"))
             .dt.total_seconds()
             .abs()
             <= 2 * 3600
         )
     )
 
-    print(f"  Pairs: {len(paired)} (note × vital) rows")
+    # Per-signal normalization → value clipped to plausible range, scaled to [0,1]
+    norm_lo = pl.lit(0.0, dtype=pl.Float32)
+    norm_hi = pl.lit(1.0, dtype=pl.Float32)
+    lo_expr = pl.col("signal_name").replace_strict(
+        {k: v[0] for k, v in NORM_RANGE.items()}, return_dtype=pl.Float32
+    )
+    hi_expr = pl.col("signal_name").replace_strict(
+        {k: v[1] for k, v in NORM_RANGE.items()}, return_dtype=pl.Float32
+    )
+    type_id_expr = pl.col("signal_name").replace_strict(
+        SIGNAL_NAME_TO_ID, return_dtype=pl.Int32
+    )
+
+    paired = paired.with_columns(
+        ((pl.col("valuenum") - lo_expr) / (hi_expr - lo_expr))
+            .clip(norm_lo, norm_hi)
+            .alias("norm_value"),
+        type_id_expr.alias("item_type_id"),
+    )
+
+    print(f"  Pairs: {len(paired)} (note × signal) rows")
     return paired
 
 
 # ---------------------------------------------------------------------------
 # Step 5 – Full pipeline
 # ---------------------------------------------------------------------------
+def write_signal_metadata(output_dir: Path) -> None:
+    """Writes signal_metadata.json so downstream code knows item_type_id mapping."""
+    meta = {
+        "n_signal_types": len(ALL_SIGNAL_NAMES),
+        "signal_names": ALL_SIGNAL_NAMES,
+        "signal_name_to_id": SIGNAL_NAME_TO_ID,
+        "norm_range": {k: list(v) for k, v in NORM_RANGE.items()},
+        "vitals_catalog": VITALS_CATALOG,
+        "labs_catalog": LABS_CATALOG,
+    }
+    out = output_dir / "signal_metadata.json"
+    out.write_text(json.dumps(meta, indent=2))
+    print(f"  Wrote signal metadata → {out}")
+
+
 def run_extraction(toy: bool = False) -> pl.DataFrame:
     """
-    Runs the complete extraction pipeline and writes the result to
-    data/processed/cardio_pairs.csv.
-
-    Args:
-        toy: Limit to the first 1 000 stays for fast local iteration.
-             Per README instructions: start with a Toy Dataset.
-
-    Returns:
-        The final paired DataFrame (already collected).
+    Runs the full extraction pipeline and writes:
+      - data/processed/cardio_pairs.csv  (note × signal pairs)
+      - data/processed/signal_metadata.json
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     output_path = PROCESSED_DIR / "cardio_pairs.csv"
 
-    print("[1/4] Loading cardio cohort...")
+    print("[1/5] Loading cardio cohort...")
     cohort = load_cohort()
     if toy:
         cohort = cohort.head(1000)
         print(f"  [toy mode] trimmed to {len(cohort)} stays")
 
-    print("[2/4] Loading radiology notes (24 h window)...")
+    print("[2/5] Loading radiology notes (24 h window, with leakage filter)...")
     notes = load_notes(cohort)
 
-    print("[3/4] Scanning chartevents for vitals (HR + BP)...")
+    print("[3/5] Scanning chartevents for vitals (7 itemids)...")
     vitals = load_vitals(cohort)
 
-    print("[4/4] Pairing notes ↔ vitals (±2 h window)...")
-    pairs = pair_notes_vitals(notes, vitals)
+    print("[4/5] Scanning labevents for labs (7 itemids)...")
+    labs = load_labs(cohort)
 
-    # Attach care-unit label and mortality for downstream use
+    print("[5/5] Pairing notes ↔ signals (±2 h window)...")
+    signals = pl.concat([vitals, labs], how="vertical")
+    pairs = pair_notes_signals(notes, signals)
+
     pairs = pairs.join(
-        cohort.select(["stay_id", "first_careunit", "mortality"]),
+        cohort.select(["stay_id", "subject_id", "first_careunit", "mortality"]),
         on="stay_id",
         how="left",
     )
 
     pairs.write_csv(output_path)
-    print(f"\nSaved {len(pairs):,} rows → {output_path}")
+    write_signal_metadata(PROCESSED_DIR)
+
+    print(
+        f"\nSaved {len(pairs):,} pairs → {output_path}\n"
+        f"  unique notes:  {pairs['note_id'].n_unique()}\n"
+        f"  unique stays:  {pairs['stay_id'].n_unique()}\n"
+        f"  unique subj:   {pairs['subject_id'].n_unique()}\n"
+        f"  signals seen:  {sorted(pairs['signal_name'].unique().to_list())}\n"
+        f"  mortality:     {pairs.unique('stay_id')['mortality'].mean():.1%}"
+    )
     return pairs
 
 
 if __name__ == "__main__":
-    run_extraction(toy=True)
+    import sys
+    toy_mode = "--full" not in sys.argv
+    run_extraction(toy=toy_mode)
