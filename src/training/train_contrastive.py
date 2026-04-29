@@ -9,15 +9,20 @@ Pipeline:
 
 Usage:
     uv run python -m src.training.train_contrastive
-    uv run python -m src.training.train_contrastive --epochs 25 --batch-size 16
+    uv run python -m src.training.train_contrastive --epochs 25 --batch-size 16 --grad-accum-steps 4
+    uv run python -m src.training.train_contrastive --preset low-data-bert
+    uv run python -m src.training.train_contrastive --val-loss-mode full
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
+import shlex
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +42,24 @@ from src.models.towers import (
     TextTower,
 )
 
+
+def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    """SHA-256 surowego pliku (np. cardio_pairs.csv) — ten sam plik = ten sam hash między osobami."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while b := f.read(chunk):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _grad_scaler_cuda(enabled: bool):
+    """torch.amp.GradScaler exists from ~2.4; torch 2.2 ma tylko torch.cuda.amp.GradScaler."""
+    amp_gs = getattr(torch.amp, "GradScaler", None)
+    if amp_gs is not None:
+        return amp_gs("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 # ---------------------------------------------------------------------------
 # Hyper-parameters (overridable via CLI)
 # ---------------------------------------------------------------------------
@@ -55,8 +78,12 @@ SEED = 42
 SIM_MATRIX_N = 64            # NxN similarity snapshot for animation
 FREEZE_BOTTOM_LAYERS = 8     # 0=fine-tune all 12 BERT layers; 8=fine-tune only top 4
 PROJ_DROPOUT = 0.2           # dropout in TextTower projection head
-GRAD_ACCUM_STEPS = 1         # effective batch = batch_size * grad_accum_steps
+GRAD_ACCUM_STEPS = 4         # effective batch = batch_size * grad_accum_steps (align val InfoNCE to this N)
 FREEZE_BERT = False          # if True, freeze all 12 BERT layers (overrides FREEZE_BOTTOM_LAYERS)
+
+# Val InfoNCE: "macro" = buffer micro-batches like train (same N as effective_batch when aligned);
+#            "full" = one InfoNCE over all val embeddings (max negative pool; needs VRAM for matmul).
+VAL_LOSS_MODE = "macro"
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +98,9 @@ def set_seed(seed: int) -> None:
 
 def git_sha() -> str:
     try:
+        repo_root = Path(__file__).resolve().parents[2]
         return subprocess.check_output(
-            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
             text=True,
         ).strip()
     except Exception:
@@ -276,24 +304,107 @@ def evaluate_val_loss(
     val_loader: DataLoader,
     temperature: float,
     device: torch.device,
-) -> float:
+    grad_accum_steps: int,
+    amp_enabled: bool,
+    val_loss_mode: str = VAL_LOSS_MODE,
+) -> tuple[float, dict[str, float | int]]:
+    """
+    Val InfoNCE aligned with training when val_loss_mode='macro': concatenate
+    micro-batches every grad_accum_steps (and remainder at end), same as train.
+
+    Returns (mean_loss, stats) where stats includes val_infonce_n_used for logging.
+    """
     text_tower.eval()
     signal_tower.eval()
-    losses = []
+
+    if val_loss_mode == "full":
+        return _evaluate_val_loss_full_batch(
+            text_tower, signal_tower, val_loader, temperature, device, amp_enabled
+        )
+
+    if val_loss_mode != "macro":
+        raise ValueError(f"val_loss_mode must be 'macro' or 'full', got {val_loss_mode!r}")
+
+    losses: list[float] = []
+    chunk_sizes: list[int] = []
+    z_text_buf: list[torch.Tensor] = []
+    z_sig_buf: list[torch.Tensor] = []
+
+    def flush() -> None:
+        if not z_text_buf:
+            return
+        z_text_cat = torch.cat(z_text_buf, dim=0)
+        z_sig_cat = torch.cat(z_sig_buf, dim=0)
+        z_text_buf.clear()
+        z_sig_buf.clear()
+        if z_text_cat.size(0) < 2:
+            return
+        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
+            loss = info_nce_loss(z_text_cat, z_sig_cat, temperature)
+        losses.append(loss.item())
+        chunk_sizes.append(int(z_text_cat.size(0)))
+
+    n_batches = len(val_loader)
+    for step, batch in enumerate(val_loader, 1):
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        item_ids = batch["item_ids"].to(device, non_blocking=True)
+        values = batch["values"].to(device, non_blocking=True)
+        signal_mask = batch["signal_mask"].to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
+            z_text = text_tower(input_ids, attention_mask)
+            z_sig = signal_tower(item_ids, values, signal_mask)
+        z_text_buf.append(z_text)
+        z_sig_buf.append(z_sig)
+        is_step = (step % grad_accum_steps == 0) or (step == n_batches)
+        if is_step:
+            flush()
+
+    if not losses:
+        stats = {"val_infonce_n_mean": 0, "val_infonce_macro_chunks": 0}
+        return float("nan"), stats
+
+    mean_loss = float(np.mean(losses))
+    stats = {
+        "val_infonce_n_mean": float(np.mean(chunk_sizes)),
+        "val_infonce_macro_chunks": len(losses),
+    }
+    return mean_loss, stats
+
+
+@torch.no_grad()
+def _evaluate_val_loss_full_batch(
+    text_tower: TextTower,
+    signal_tower: SignalTower,
+    val_loader: DataLoader,
+    temperature: float,
+    device: torch.device,
+    amp_enabled: bool,
+) -> tuple[float, dict[str, float | int]]:
+    """Single InfoNCE over all validation embeddings (largest possible negative set)."""
+    text_tower.eval()
+    signal_tower.eval()
+    z_text_chunks: list[torch.Tensor] = []
+    z_sig_chunks: list[torch.Tensor] = []
     for batch in val_loader:
-        z_text = text_tower(
-            batch["input_ids"].to(device),
-            batch["attention_mask"].to(device),
-        )
-        z_sig = signal_tower(
-            batch["item_ids"].to(device),
-            batch["values"].to(device),
-            batch["signal_mask"].to(device),
-        )
-        if z_text.size(0) < 2:
-            continue  # InfoNCE undefined for batch=1
-        losses.append(info_nce_loss(z_text, z_sig, temperature).item())
-    return float(np.mean(losses)) if losses else float("nan")
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        item_ids = batch["item_ids"].to(device, non_blocking=True)
+        values = batch["values"].to(device, non_blocking=True)
+        signal_mask = batch["signal_mask"].to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
+            z_text_chunks.append(text_tower(input_ids, attention_mask))
+            z_sig_chunks.append(signal_tower(item_ids, values, signal_mask))
+    if not z_text_chunks:
+        return float("nan"), {"val_infonce_n_used": 0}
+    z_text = torch.cat(z_text_chunks, dim=0)
+    z_sig = torch.cat(z_sig_chunks, dim=0)
+    n = int(z_text.size(0))
+    if n < 2:
+        return float("nan"), {"val_infonce_n_used": n}
+    with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
+        loss = info_nce_loss(z_text, z_sig, temperature)
+    return loss.item(), {"val_infonce_n_used": n}
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +428,9 @@ def train(
     proj_dropout: float = PROJ_DROPOUT,
     grad_accum_steps: int = GRAD_ACCUM_STEPS,
     freeze_bert: bool = FREEZE_BERT,
+    val_loss_mode: str = VAL_LOSS_MODE,
+    training_preset: str = "none",
+    cli_argv: list[str] | None = None,
 ) -> Path:
     """
     Main training entry. Returns path to the run directory:
@@ -349,10 +463,14 @@ def train(
         num_workers=2, pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
+    # drop_last=False: remainder is merged into last macro-batch (same as train's end-of-epoch flush)
     val_loader = DataLoader(
         Subset(dataset, val_idx),
-        batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=(device.type == "cuda"),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
     )
 
     # Fixed indices for similarity-matrix snapshots (NxN, sorted note_ids for stability)
@@ -388,7 +506,7 @@ def train(
     )
 
     amp_enabled = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    scaler = _grad_scaler_cuda(amp_enabled)
 
     # --- Run config (saved upfront so a crashed run is still self-describing) ---
     config = {
@@ -418,12 +536,26 @@ def train(
         "effective_batch": int(batch_size * grad_accum_steps),
         "bert_trainable_params": int(n_bert_train),
         "bert_total_params": int(n_bert_total),
-        "infonce_baseline_ln_batch": float(np.log(batch_size * grad_accum_steps)),
+        "infonce_baseline_ln_train": float(np.log(batch_size * grad_accum_steps)),
+        "val_loss_mode": val_loss_mode,
+        "val_macro_accum_steps": grad_accum_steps,
+        "infonce_baseline_ln_val_macro_aligned": float(np.log(batch_size * grad_accum_steps)),
+        "training_preset": training_preset,
+        "cli_argv": list(cli_argv) if cli_argv else [],
+        "cardio_pairs_sha256": _sha256_file(csv_path) if csv_path.is_file() else None,
     }
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+    if cli_argv:
+        quoted = " ".join(shlex.quote(a) for a in cli_argv)
+        (run_dir / "RUN_COMMAND.txt").write_text(
+            f"{quoted}\n\n"
+            "# Powiel na innej maszynie (ten sam repo, ten sam cardio_pairs.csv po sha256).\n"
+        )
 
     log_path = run_dir / "log.csv"
-    log_path.write_text("epoch,train_loss,val_loss,lr,elapsed_s\n")
+    log_path.write_text(
+        "epoch,train_loss,val_loss,val_infonce_n_mean,lr,elapsed_s\n"
+    )
 
     # --- Snapshot epoch 0 (pre-training baseline) ---
     print("\nSnapshot epoch 0 (pre-training)…")
@@ -438,7 +570,8 @@ def train(
     effective_batch = batch_size * grad_accum_steps
     print(f"\nTraining for {epochs} epochs | train={len(train_idx)} val={len(val_idx)} "
           f"| batch={batch_size} × accum={grad_accum_steps} = effective {effective_batch} "
-          f"| InfoNCE baseline = ln({effective_batch}) = {np.log(effective_batch):.3f}\n")
+          f"| InfoNCE baseline = ln({effective_batch}) = {np.log(effective_batch):.3f}\n"
+          f"| val_loss_mode={val_loss_mode} (macro aligns val InfoNCE batching with train)\n")
 
     # When grad_accum > 1, we collect z_text/z_signal across micro-batches and
     # compute InfoNCE on the concatenated tensor — that is what makes
@@ -501,14 +634,30 @@ def train(
                       f"(micro {step}/{len(train_loader)}) | loss {loss.item():.4f}")
 
         train_loss = epoch_loss / max(1, n_optim_steps)
-        val_loss = evaluate_val_loss(text_tower, signal_tower, val_loader, temperature, device)
+        val_loss, val_stats = evaluate_val_loss(
+            text_tower,
+            signal_tower,
+            val_loader,
+            temperature,
+            device,
+            grad_accum_steps=grad_accum_steps,
+            amp_enabled=amp_enabled,
+            val_loss_mode=val_loss_mode,
+        )
+        if "val_infonce_n_used" in val_stats:
+            val_n = float(val_stats["val_infonce_n_used"])
+        else:
+            val_n = float(val_stats.get("val_infonce_n_mean", 0.0))
         elapsed = time.time() - t0
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"Epoch {epoch}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f} "
-              f"| lr {current_lr:.2e} | {elapsed:.1f}s\n")
+              f"| val_N≈{val_n:.1f} | lr {current_lr:.2e} | {elapsed:.1f}s\n")
 
         with log_path.open("a") as f:
-            f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{current_lr:.6e},{elapsed:.2f}\n")
+            f.write(
+                f"{epoch},{train_loss:.6f},{val_loss:.6f},{float(val_n):.2f},"
+                f"{current_lr:.6e},{elapsed:.2f}\n"
+            )
 
         # Per-epoch snapshot
         _take_snapshot(
@@ -583,6 +732,19 @@ def _take_snapshot(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def apply_training_preset(ns: argparse.Namespace) -> None:
+    """Tune defaults for small radiology cohort vs full BERT (roadmap: freeze + accum)."""
+    if ns.preset != "low-data-bert":
+        return
+    ns.freeze_bert = True
+    if ns.grad_accum_steps == GRAD_ACCUM_STEPS:
+        ns.grad_accum_steps = 4
+    if ns.lr_head == LR_HEAD:
+        ns.lr_head = 2e-4
+    if ns.lr_bert == LR_BERT:
+        ns.lr_bert = 0.0
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: Contrastive pre-training")
     p.add_argument("--epochs", type=int, default=EPOCHS)
@@ -603,11 +765,28 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum-steps", type=int, default=GRAD_ACCUM_STEPS,
                    help="Gradient accumulation steps. Effective batch = batch_size × this. "
                         "InfoNCE is computed on the concatenated effective batch.")
+    p.add_argument(
+        "--val-loss-mode",
+        type=str,
+        choices=("macro", "full"),
+        default=VAL_LOSS_MODE,
+        help="macro: buffer val batches like train (aligned N); "
+             "full: one InfoNCE over entire val set (max negatives; higher VRAM).",
+    )
+    p.add_argument(
+        "--preset",
+        type=str,
+        choices=("none", "low-data-bert"),
+        default="none",
+        help="low-data-bert: freeze BERT, lr_bert=0, lr_head=2e-4, accum=4 if defaults unchanged.",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.preset == "low-data-bert":
+        apply_training_preset(args)
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
     train(
@@ -627,4 +806,7 @@ if __name__ == "__main__":
         freeze_bert=args.freeze_bert,
         proj_dropout=args.proj_dropout,
         grad_accum_steps=args.grad_accum_steps,
+        val_loss_mode=args.val_loss_mode,
+        training_preset=args.preset,
+        cli_argv=sys.argv,
     )

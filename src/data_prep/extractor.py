@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import polars as pl
@@ -8,18 +9,35 @@ import polars as pl
 from src.data_prep.cleaner import filter_leakage_phrases
 
 # ---------------------------------------------------------------------------
-# Config – hard-coded paths to raw MIMIC-IV data
+# Config – MIMIC-IV data roots (override with env vars — pendrive / another disk)
 # ---------------------------------------------------------------------------
-MIMIC_BASE = Path(
-    "/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe"
-    "/datasets/mimic/files/mimiciv/3.1"
-)
-NOTES_BASE = Path(
-    "/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe"
-    "/datasets/mimic-notes/files/mimic-iv-note/2.2"
-)
+# Default: <repo>/data/raw/mimiciv/3.1 and …/mimic-iv-note/2.2
+# Override if needed:
+#   export MIMIC_IV_ROOT="/Volumes/MyDrive/mimiciv/3.1"
+#   export MIMIC_IV_NOTE_ROOT="/Volumes/MyDrive/mimic-iv-note/2.2"
+#
+# Expected layout under MIMIC_IV_ROOT:
+#   icu/icustays.csv.gz, icu/chartevents.csv.gz, hosp/admissions.csv.gz, hosp/labevents.csv.gz
+# Under MIMIC_IV_NOTE_ROOT:
+#   note/radiology.csv.gz
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _root_from_env(var: str, fallback: Path) -> Path:
+    raw = os.getenv(var, "").strip()
+    return Path(raw).expanduser() if raw else fallback
+
+
+MIMIC_BASE = _root_from_env(
+    "MIMIC_IV_ROOT",
+    PROJECT_ROOT / "data" / "raw" / "mimiciv" / "3.1",
+)
+NOTES_BASE = _root_from_env(
+    "MIMIC_IV_NOTE_ROOT",
+    PROJECT_ROOT / "data" / "raw" / "mimic-iv-note" / "2.2",
+)
+
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 CARDIO_UNITS = [
@@ -262,25 +280,71 @@ def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 – Pair each note with all signals within ±2 h
+# Step 4 – Pair notes ↔ signals (note-level window or stay-level)
 # ---------------------------------------------------------------------------
-def pair_notes_signals(notes: pl.DataFrame, signals: pl.DataFrame) -> pl.DataFrame:
+PAIR_STRATEGY_NOTE = "note_level"
+PAIR_STRATEGY_STAY = "stay_level"
+
+
+def aggregate_notes_per_stay(notes: pl.DataFrame) -> pl.DataFrame:
     """
-    For every note, finds all signals from the same stay_id whose event_time
-    lies within ±2 hours of the note_time.
+    Collapse radiology notes to one row per stay: texts concatenated in time order.
+    Synthetic ``note_id``: ``stay_<stay_id>`` for downstream CardiacPairsDataset.
+    """
+    out = (
+        notes.sort("note_time")
+        .group_by("stay_id", maintain_order=True)
+        .agg([
+            pl.col("text").implode().list.join("\n\n").alias("text"),
+            pl.col("note_time").min().alias("note_time"),
+        ])
+        .with_columns(
+            (pl.lit("stay_") + pl.col("stay_id").cast(pl.Utf8)).alias("note_id")
+        )
+    )
+    return out.select(["note_id", "stay_id", "note_time", "text"])
+
+
+def pair_notes_signals(
+    notes: pl.DataFrame,
+    signals: pl.DataFrame,
+    *,
+    pair_strategy: str = PAIR_STRATEGY_NOTE,
+    pair_window_hours: float = 2.0,
+) -> pl.DataFrame:
+    """
+    ``note_level``: for each note, keep signals with ``event_time`` within
+    ±pair_window_hours of ``note_time``.
+
+    ``stay_level``: one synthetic note per stay (concatenated texts); pair with
+    **all** signals in the stay's 24h window (already enforced in ``load_*``).
 
     Returns one row per (note, signal) pair with normalized value and
     item_type_id (0..N_signals-1).
     """
-    paired = (
-        notes.join(signals, on="stay_id", how="inner")
-        .filter(
-            (pl.col("event_time") - pl.col("note_time"))
-            .dt.total_seconds()
-            .abs()
-            <= 2 * 3600
+    if pair_strategy == PAIR_STRATEGY_STAY:
+        note_rows = aggregate_notes_per_stay(notes)
+        paired = note_rows.join(signals, on="stay_id", how="inner")
+        print("  Pairing strategy: stay_level (full 24h vitals/labs vs concatenated notes)")
+    elif pair_strategy == PAIR_STRATEGY_NOTE:
+        window_sec = float(pair_window_hours) * 3600.0
+        paired = (
+            notes.join(signals, on="stay_id", how="inner")
+            .filter(
+                (pl.col("event_time") - pl.col("note_time"))
+                .dt.total_seconds()
+                .abs()
+                <= window_sec
+            )
         )
-    )
+        print(
+            f"  Pairing strategy: note_level (±{pair_window_hours:g} h window)"
+        )
+    else:
+        raise ValueError(
+            f"pair_strategy must be '{PAIR_STRATEGY_NOTE}' or '{PAIR_STRATEGY_STAY}', "
+            f"got {pair_strategy!r}"
+        )
 
     # Per-signal normalization → value clipped to plausible range, scaled to [0,1]
     norm_lo = pl.lit(0.0, dtype=pl.Float32)
@@ -309,9 +373,14 @@ def pair_notes_signals(notes: pl.DataFrame, signals: pl.DataFrame) -> pl.DataFra
 # ---------------------------------------------------------------------------
 # Step 5 – Full pipeline
 # ---------------------------------------------------------------------------
-def write_signal_metadata(output_dir: Path) -> None:
+def write_signal_metadata(
+    output_dir: Path,
+    *,
+    pair_strategy: str | None = None,
+    pair_window_hours: float | None = None,
+) -> None:
     """Writes signal_metadata.json so downstream code knows item_type_id mapping."""
-    meta = {
+    meta: dict = {
         "n_signal_types": len(ALL_SIGNAL_NAMES),
         "signal_names": ALL_SIGNAL_NAMES,
         "signal_name_to_id": SIGNAL_NAME_TO_ID,
@@ -319,12 +388,21 @@ def write_signal_metadata(output_dir: Path) -> None:
         "vitals_catalog": VITALS_CATALOG,
         "labs_catalog": LABS_CATALOG,
     }
+    if pair_strategy is not None:
+        meta["pair_strategy"] = pair_strategy
+    if pair_window_hours is not None:
+        meta["pair_window_hours"] = pair_window_hours
     out = output_dir / "signal_metadata.json"
     out.write_text(json.dumps(meta, indent=2))
     print(f"  Wrote signal metadata → {out}")
 
 
-def run_extraction(toy: bool = False) -> pl.DataFrame:
+def run_extraction(
+    toy: bool = False,
+    *,
+    pair_strategy: str = PAIR_STRATEGY_NOTE,
+    pair_window_hours: float = 2.0,
+) -> pl.DataFrame:
     """
     Runs the full extraction pipeline and writes:
       - data/processed/cardio_pairs.csv  (note × signal pairs)
@@ -348,9 +426,14 @@ def run_extraction(toy: bool = False) -> pl.DataFrame:
     print("[4/5] Scanning labevents for labs (7 itemids)...")
     labs = load_labs(cohort)
 
-    print("[5/5] Pairing notes ↔ signals (±2 h window)...")
+    print("[5/5] Pairing notes ↔ signals...")
     signals = pl.concat([vitals, labs], how="vertical")
-    pairs = pair_notes_signals(notes, signals)
+    pairs = pair_notes_signals(
+        notes,
+        signals,
+        pair_strategy=pair_strategy,
+        pair_window_hours=pair_window_hours,
+    )
 
     pairs = pairs.join(
         cohort.select(["stay_id", "subject_id", "first_careunit", "mortality"]),
@@ -359,7 +442,11 @@ def run_extraction(toy: bool = False) -> pl.DataFrame:
     )
 
     pairs.write_csv(output_path)
-    write_signal_metadata(PROCESSED_DIR)
+    write_signal_metadata(
+        PROCESSED_DIR,
+        pair_strategy=pair_strategy,
+        pair_window_hours=pair_window_hours,
+    )
 
     print(
         f"\nSaved {len(pairs):,} pairs → {output_path}\n"
@@ -373,6 +460,29 @@ def run_extraction(toy: bool = False) -> pl.DataFrame:
 
 
 if __name__ == "__main__":
-    import sys
-    toy_mode = "--full" not in sys.argv
-    run_extraction(toy=toy_mode)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MIMIC CCU/CVICU → cardio_pairs.csv")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Use full cohort (default: toy subset of 1000 stays)",
+    )
+    parser.add_argument(
+        "--pair-strategy",
+        choices=(PAIR_STRATEGY_NOTE, PAIR_STRATEGY_STAY),
+        default=PAIR_STRATEGY_NOTE,
+        help="note_level: ±window around each note; stay_level: one sample per stay (concat notes + 24h signals)",
+    )
+    parser.add_argument(
+        "--pair-window-hours",
+        type=float,
+        default=2.0,
+        help="Half-width in hours for note_level pairing (ignored for stay_level)",
+    )
+    args = parser.parse_args()
+    run_extraction(
+        toy=not args.full,
+        pair_strategy=args.pair_strategy,
+        pair_window_hours=args.pair_window_hours,
+    )

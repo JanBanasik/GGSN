@@ -41,7 +41,8 @@ class TextTower(nn.Module):
         proj_dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.bert = AutoModel.from_pretrained(model_name)
+        # Safetensors only: transformers+torch<2.6 cannot torch.load pytorch_model.bin (CVE-2025-32434 guard).
+        self.bert = AutoModel.from_pretrained(model_name, use_safetensors=True)
         bert_hidden = self.bert.config.hidden_size  # 768 for BERT-base
 
         self.proj = nn.Sequential(
