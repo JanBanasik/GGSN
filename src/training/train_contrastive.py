@@ -229,6 +229,37 @@ def split_indices_by_subject(
     return train_idx, val_idx
 
 
+def limit_indices_by_subject(
+    dataset: CardiacPairsDataset,
+    indices: list[int],
+    max_notes: int | None,
+) -> list[int]:
+    """
+    Deterministically keep whole-subject chunks until we reach roughly max_notes.
+    This keeps the no-subject-leakage property while allowing fast demo runs.
+    """
+    if max_notes is None or max_notes <= 0 or len(indices) <= max_notes:
+        return indices
+
+    by_subject: dict[int, list[int]] = {}
+    subject_order: list[int] = []
+    for idx in indices:
+        sid = dataset.subject_ids[idx]
+        if sid not in by_subject:
+            by_subject[sid] = []
+            subject_order.append(sid)
+        by_subject[sid].append(idx)
+
+    kept: list[int] = []
+    for sid in subject_order:
+        chunk = by_subject[sid]
+        if kept and len(kept) + len(chunk) > max_notes:
+            break
+        kept.extend(chunk)
+
+    return kept if kept else indices[:max_notes]
+
+
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
@@ -429,6 +460,8 @@ def train(
     grad_accum_steps: int = GRAD_ACCUM_STEPS,
     freeze_bert: bool = FREEZE_BERT,
     val_loss_mode: str = VAL_LOSS_MODE,
+    max_train_notes: int | None = None,
+    max_val_notes: int | None = None,
     training_preset: str = "none",
     cli_argv: list[str] | None = None,
 ) -> Path:
@@ -455,6 +488,8 @@ def train(
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
     dataset = CardiacPairsDataset(csv_path, tokenizer)
     train_idx, val_idx = split_indices_by_subject(dataset, val_frac, seed)
+    train_idx = limit_indices_by_subject(dataset, train_idx, max_train_notes)
+    val_idx = limit_indices_by_subject(dataset, val_idx, max_val_notes)
     print(f"  Train notes: {len(train_idx)} | Val notes: {len(val_idx)}")
 
     train_loader = DataLoader(
@@ -517,6 +552,8 @@ def train(
         "n_train": len(train_idx),
         "n_val": len(val_idx),
         "n_subjects_total": len(set(dataset.subject_ids)),
+        "max_train_notes": max_train_notes,
+        "max_val_notes": max_val_notes,
         "epochs": epochs,
         "batch_size": batch_size,
         "lr_bert": lr_bert,
@@ -734,15 +771,33 @@ def _take_snapshot(
 # ---------------------------------------------------------------------------
 def apply_training_preset(ns: argparse.Namespace) -> None:
     """Tune defaults for small radiology cohort vs full BERT (roadmap: freeze + accum)."""
-    if ns.preset != "low-data-bert":
+    if ns.preset == "low-data-bert":
+        ns.freeze_bert = True
+        if ns.grad_accum_steps == GRAD_ACCUM_STEPS:
+            ns.grad_accum_steps = 4
+        if ns.lr_head == LR_HEAD:
+            ns.lr_head = 2e-4
+        if ns.lr_bert == LR_BERT:
+            ns.lr_bert = 0.0
         return
-    ns.freeze_bert = True
-    if ns.grad_accum_steps == GRAD_ACCUM_STEPS:
-        ns.grad_accum_steps = 4
-    if ns.lr_head == LR_HEAD:
-        ns.lr_head = 2e-4
-    if ns.lr_bert == LR_BERT:
-        ns.lr_bert = 0.0
+
+    if ns.preset == "presentation-short":
+        ns.freeze_bert = True
+        if ns.epochs == EPOCHS:
+            ns.epochs = 4
+        if ns.batch_size == BATCH_SIZE:
+            ns.batch_size = 8
+        if ns.grad_accum_steps == GRAD_ACCUM_STEPS:
+            ns.grad_accum_steps = 2
+        if ns.lr_head == LR_HEAD:
+            ns.lr_head = 2e-4
+        if ns.lr_bert == LR_BERT:
+            ns.lr_bert = 0.0
+        if ns.max_train_notes is None:
+            ns.max_train_notes = 768
+        if ns.max_val_notes is None:
+            ns.max_val_notes = 192
+        return
 
 
 def _parse_args() -> argparse.Namespace:
@@ -766,6 +821,18 @@ def _parse_args() -> argparse.Namespace:
                    help="Gradient accumulation steps. Effective batch = batch_size × this. "
                         "InfoNCE is computed on the concatenated effective batch.")
     p.add_argument(
+        "--max-train-notes",
+        type=int,
+        default=None,
+        help="Optionally limit train notes for quick demo/debug runs; keeps whole-subject chunks.",
+    )
+    p.add_argument(
+        "--max-val-notes",
+        type=int,
+        default=None,
+        help="Optionally limit validation notes for quick demo/debug runs; keeps whole-subject chunks.",
+    )
+    p.add_argument(
         "--val-loss-mode",
         type=str,
         choices=("macro", "full"),
@@ -776,16 +843,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--preset",
         type=str,
-        choices=("none", "low-data-bert"),
+        choices=("none", "low-data-bert", "presentation-short"),
         default="none",
-        help="low-data-bert: freeze BERT, lr_bert=0, lr_head=2e-4, accum=4 if defaults unchanged.",
+        help="low-data-bert: freeze BERT, lr_bert=0, lr_head=2e-4, accum=4 if defaults unchanged. "
+             "presentation-short: quick run for animations/presentation (4 epochs, smaller subsets).",
     )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    if args.preset == "low-data-bert":
+    if args.preset != "none":
         apply_training_preset(args)
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -807,6 +875,8 @@ if __name__ == "__main__":
         proj_dropout=args.proj_dropout,
         grad_accum_steps=args.grad_accum_steps,
         val_loss_mode=args.val_loss_mode,
+        max_train_notes=args.max_train_notes,
+        max_val_notes=args.max_val_notes,
         training_preset=args.preset,
         cli_argv=sys.argv,
     )
