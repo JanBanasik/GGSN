@@ -34,4 +34,4 @@ env/
 *.ckpt
 runs/
 outputs/
-media/
+media/.*
