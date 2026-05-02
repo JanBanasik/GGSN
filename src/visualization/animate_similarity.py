@@ -87,9 +87,10 @@ class SimilarityEvolution(Scene):
     """Animuje N×N macierz cosine sim epoka-po-epoce."""
 
     # Config
-    CELL_SIZE = 0.10        # długość boku komórki w jednostkach manim
-    GRID_MAX_N = 32         # przyciąć N do tego (większe są nieczytelne)
-    HOLD_PER_EPOCH = 0.45   # sekund per epoka
+    CELL_SIZE = 0.20        # większe komórki = wyraźniejszy kontrast
+    GRID_MAX_N = 16         # mniej komórek = każda lepiej widoczna
+    HOLD_PER_EPOCH = 1.0    # wolniej = łatwiej zobaczyć zmiany
+    PER_EPOCH_NORMALIZE = True  # normalize colors per-frame (relative diagonal pop)
 
     def construct(self):
         run_dir = latest_run()
@@ -101,17 +102,34 @@ class SimilarityEvolution(Scene):
         n = min(n_full, self.GRID_MAX_N)
         matrices = [m[:n, :n] for m in matrices]
 
-        # Wspólna skala kolorów: użyj global min/max po wszystkich klatkach
-        all_vals = np.concatenate([m.flatten() for m in matrices])
-        vmin, vmax = float(all_vals.min()), float(all_vals.max())
+        # Skala kolorów: per-epoch (każda klatka pokazuje swój relatywny kontrast)
+        # albo global (porównanie absolutnych wartości między epokami)
+        if self.PER_EPOCH_NORMALIZE:
+            scales = [(float(m.min()), float(m.max())) for m in matrices]
+        else:
+            all_vals = np.concatenate([m.flatten() for m in matrices])
+            vmin_g, vmax_g = float(all_vals.min()), float(all_vals.max())
+            scales = [(vmin_g, vmax_g)] * len(matrices)
+        vmin, vmax = scales[0]
+        # Legenda: pokaż globalny zakres dla referencji
+        legend_vmin = min(s[0] for s in scales)
+        legend_vmax = max(s[1] for s in scales)
 
         # === Tytuł i podtytuł ===
+        # Użyj effective_batch jeśli config go ma (po refactor val_loss_mode=macro),
+        # fallback do batch_size dla starych runów.
+        eff_b = int(config.get("effective_batch", config["batch_size"]))
+        baseline_eff = float(np.log(eff_b))
+        accum = int(config.get("grad_accum_steps", 1))
+        batch_str = (
+            f"batch={config['batch_size']}×accum={accum}=eff {eff_b}"
+            if accum > 1 else f"batch={eff_b}"
+        )
         title = Text(
             "Macierz podobieństw cos(text, signal)", font_size=32, weight="BOLD"
         ).to_edge(UP, buff=0.4)
         subtitle = Text(
-            f"τ={config['temperature']} · batch={config['batch_size']} · "
-            f"baseline ln(B)={np.log(config['batch_size']):.2f}",
+            f"τ={config['temperature']} · {batch_str} · baseline ln({eff_b})={baseline_eff:.2f}",
             font_size=20,
         ).next_to(title, DOWN, buff=0.15)
 
@@ -148,7 +166,7 @@ class SimilarityEvolution(Scene):
         cell_group.shift(0.2 * DOWN)
 
         # === Pasek skali (legend) po prawej ===
-        legend = self._build_legend(vmin, vmax).next_to(cell_group, RIGHT, buff=0.4)
+        legend = self._build_legend(legend_vmin, legend_vmax).next_to(cell_group, RIGHT, buff=0.4)
 
         # === Etykieta osi ===
         x_axis_label = Text("signal_j →", font_size=18).next_to(cell_group, DOWN, buff=0.1)
@@ -164,13 +182,14 @@ class SimilarityEvolution(Scene):
         self.wait(0.6)
 
         # Animacja po epokach
-        for epoch_idx, mat in zip(epochs[1:], matrices[1:]):
+        for ep_pos, (epoch_idx, mat) in enumerate(zip(epochs[1:], matrices[1:]), start=1):
             new_label = Text(f"Epoka {epoch_idx:>3d} / {epochs[-1]}", font_size=28).move_to(epoch_label)
 
+            v_lo, v_hi = scales[ep_pos]
             anims = [epoch_label.animate.become(new_label)]
             for i in range(n):
                 for j in range(n):
-                    new_color = value_to_color(mat[i, j], vmin, vmax)
+                    new_color = value_to_color(mat[i, j], v_lo, v_hi)
                     anims.append(cells[i][j].animate.set_fill(new_color, opacity=1.0))
             self.play(*anims, run_time=self.HOLD_PER_EPOCH)
 

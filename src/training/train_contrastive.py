@@ -61,6 +61,74 @@ def _grad_scaler_cuda(enabled: bool):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint helpers (resume training across sessions)
+# ---------------------------------------------------------------------------
+CHECKPOINT_NAME = "checkpoint.pt"
+# Hyperparams that, if changed at resume time, invalidate the optimizer/scheduler
+# state (different param shapes or different LR-schedule trajectory). Other fields
+# (epochs, max_time_hours, early_stop_patience) can change freely.
+CKPT_LOCKED_KEYS = (
+    "batch_size", "grad_accum_steps", "embed_dim", "freeze_bert",
+    "freeze_bottom_layers", "proj_dropout", "lr_bert", "lr_head",
+    "temperature", "seed", "val_frac",
+)
+
+
+def save_checkpoint(path: Path, **state) -> None:
+    """Atomic-ish: write to .tmp then rename, so a Ctrl-C mid-write doesn't corrupt."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, tmp)
+    tmp.replace(path)
+
+
+def load_checkpoint(path: Path, device: torch.device) -> dict:
+    """Load on CPU first then move per-tensor to avoid VRAM spike (see plan, edge cases)."""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def restore_rng(ckpt: dict) -> None:
+    torch.set_rng_state(ckpt["torch_rng"])
+    if ckpt.get("torch_cuda_rng") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ckpt["torch_cuda_rng"])
+    np.random.set_state(ckpt["numpy_rng"])
+    random.setstate(ckpt["python_rng"])
+
+
+def collect_rng_state() -> dict:
+    return {
+        "torch_rng": torch.get_rng_state(),
+        "torch_cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+    }
+
+
+def validate_resume_config(ckpt_config: dict, current_config: dict, force: bool) -> None:
+    """
+    At resume time: compare locked hyperparams. If any differ → raise unless --force.
+
+    Locked = anything that would invalidate optimizer/scheduler state (param shapes,
+    LR trajectory). Free to change between sessions: epochs, max_time_hours,
+    early_stop_patience, sim_matrix_n.
+    """
+    diffs = {
+        k: (ckpt_config.get(k), current_config.get(k))
+        for k in CKPT_LOCKED_KEYS
+        if ckpt_config.get(k) != current_config.get(k)
+    }
+    if not diffs:
+        return
+    msg_lines = ["[resume] Locked hyperparam mismatch vs checkpoint:"]
+    for k, (old, new) in diffs.items():
+        msg_lines.append(f"  {k}: ckpt={old!r}  cli={new!r}")
+    msg_lines.append("Pass --force to override (optimizer/scheduler may be invalid).")
+    msg = "\n".join(msg_lines)
+    if not force:
+        raise RuntimeError(msg)
+    print(f"[resume] WARNING (--force):\n{msg}")
+
+
+# ---------------------------------------------------------------------------
 # Hyper-parameters (overridable via CLI)
 # ---------------------------------------------------------------------------
 EPOCHS = 25
@@ -121,6 +189,8 @@ class CardiacPairsDataset(Dataset):
         item_ids        (SEQ_LEN,)      long  – signal type indices
         values          (SEQ_LEN,)      float – normalised values in [0,1]
         signal_mask     (SEQ_LEN,)      float – 1 for real event, 0 for pad
+        hours           (SEQ_LEN,)      float – event_hours_from_intime / 24 ∈ [0,1]
+                                                 (zeros when CSV doesn't have this column)
         note_id         str
         subject_id      int
         mortality       int
@@ -134,6 +204,7 @@ class CardiacPairsDataset(Dataset):
         seq_len: int = SEQ_LEN,
     ) -> None:
         df = pl.read_csv(csv_path)
+        has_hours = "event_hours_from_intime" in df.columns
 
         # Collect ordered events per note
         per_note: dict[str, dict] = {}
@@ -145,23 +216,31 @@ class CardiacPairsDataset(Dataset):
                 "mortality": int(row["mortality"]),
                 "items": [],
                 "values": [],
+                "hours": [],
             })
             entry["items"].append(int(row["item_type_id"]))
             entry["values"].append(float(row["norm_value"]))
+            if has_hours:
+                # Normalize to [0, 1] by /24 — extractor already clips to [0, 24]
+                entry["hours"].append(float(row["event_hours_from_intime"]) / 24.0)
+            else:
+                entry["hours"].append(0.0)
 
         self.tokenizer = tokenizer
         self.max_text_len = max_text_len
         self.seq_len = seq_len
+        self.has_hours = has_hours
 
         self.note_ids: list[str] = []
         self.encodings: list[dict] = []
         self.item_ids: list[torch.Tensor] = []
         self.values: list[torch.Tensor] = []
+        self.hours: list[torch.Tensor] = []
         self.signal_masks: list[torch.Tensor] = []
         self.subject_ids: list[int] = []
         self.mortality: list[int] = []
 
-        print(f"  Tokenising {len(per_note)} unique notes…")
+        print(f"  Tokenising {len(per_note)} unique notes… (hours column: {has_hours})")
         for nid, entry in per_note.items():
             enc = tokenizer(
                 entry["text"],
@@ -173,11 +252,13 @@ class CardiacPairsDataset(Dataset):
 
             items = entry["items"][:seq_len]
             values = entry["values"][:seq_len]
+            hours_seq = entry["hours"][:seq_len]
             real_n = len(items)
             pad_n = seq_len - real_n
             if pad_n > 0:
                 items = items + [0] * pad_n
                 values = values + [0.0] * pad_n
+                hours_seq = hours_seq + [0.0] * pad_n
 
             mask = [1.0] * real_n + [0.0] * pad_n
 
@@ -188,6 +269,7 @@ class CardiacPairsDataset(Dataset):
             })
             self.item_ids.append(torch.tensor(items, dtype=torch.long))
             self.values.append(torch.tensor(values, dtype=torch.float32))
+            self.hours.append(torch.tensor(hours_seq, dtype=torch.float32))
             self.signal_masks.append(torch.tensor(mask, dtype=torch.float32))
             self.subject_ids.append(entry["subject_id"])
             self.mortality.append(entry["mortality"])
@@ -201,6 +283,7 @@ class CardiacPairsDataset(Dataset):
             "attention_mask": self.encodings[idx]["attention_mask"],
             "item_ids": self.item_ids[idx],
             "values": self.values[idx],
+            "hours": self.hours[idx],
             "signal_mask": self.signal_masks[idx],
             "note_id": self.note_ids[idx],
             "subject_id": self.subject_ids[idx],
@@ -289,9 +372,10 @@ def compute_similarity_matrix(
     item_ids = torch.stack([it["item_ids"] for it in items]).to(device)
     values = torch.stack([it["values"] for it in items]).to(device)
     signal_mask = torch.stack([it["signal_mask"] for it in items]).to(device)
+    hours = torch.stack([it["hours"] for it in items]).to(device)
 
     z_text = text_tower(input_ids, attention_mask)              # (N, D)
-    z_sig = signal_tower(item_ids, values, signal_mask)         # (N, D)
+    z_sig = signal_tower(item_ids, values, signal_mask, hours)  # (N, D)
     sim = (z_text @ z_sig.T).cpu().numpy()
     note_ids = [it["note_id"] for it in items]
     return sim, note_ids
@@ -351,9 +435,10 @@ def evaluate_val_loss(
         item_ids = batch["item_ids"].to(device, non_blocking=True)
         values = batch["values"].to(device, non_blocking=True)
         signal_mask = batch["signal_mask"].to(device, non_blocking=True)
+        hours = batch["hours"].to(device, non_blocking=True)
         with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
             z_text = text_tower(input_ids, attention_mask)
-            z_sig = signal_tower(item_ids, values, signal_mask)
+            z_sig = signal_tower(item_ids, values, signal_mask, hours)
         z_text_buf.append(z_text)
         z_sig_buf.append(z_sig)
         is_step = (step % grad_accum_steps == 0) or (step == n_batches)
@@ -392,9 +477,10 @@ def _evaluate_val_loss_full_batch(
         item_ids = batch["item_ids"].to(device, non_blocking=True)
         values = batch["values"].to(device, non_blocking=True)
         signal_mask = batch["signal_mask"].to(device, non_blocking=True)
+        hours = batch["hours"].to(device, non_blocking=True)
         with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
             z_text_chunks.append(text_tower(input_ids, attention_mask))
-            z_sig_chunks.append(signal_tower(item_ids, values, signal_mask))
+            z_sig_chunks.append(signal_tower(item_ids, values, signal_mask, hours))
     if not z_text_chunks:
         return float("nan"), {"val_infonce_n_used": 0}
     z_text = torch.cat(z_text_chunks, dim=0)
@@ -431,10 +517,19 @@ def train(
     val_loss_mode: str = VAL_LOSS_MODE,
     training_preset: str = "none",
     cli_argv: list[str] | None = None,
+    resume_from: str | None = None,
+    max_time_hours: float | None = None,
+    force: bool = False,
 ) -> Path:
     """
-    Main training entry. Returns path to the run directory:
-        data/snapshots/run_<YYYYmmdd_HHMMSS>/
+    Main training entry. Returns path to the run directory.
+
+    Args:
+        resume_from: path to existing run dir; loads checkpoint.pt and continues.
+            Run continues IN THE SAME directory (log.csv appended).
+        max_time_hours: stop cleanly after this many hours wall-clock; checkpoint
+            written before exit. Resume command printed for next session.
+        force: allow resume despite locked-hyperparam mismatch.
     """
     set_seed(seed)
 
@@ -445,11 +540,19 @@ def train(
         print(f"VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"AMP    : {use_amp and device.type == 'cuda'}")
 
-    # Run directory
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = snapshots_root / f"run_{run_id}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Run dir: {run_dir}")
+    # Run directory: new run OR continuation of existing one
+    is_resume = resume_from is not None
+    if is_resume:
+        run_dir = Path(resume_from).resolve()
+        if not (run_dir / CHECKPOINT_NAME).exists():
+            raise FileNotFoundError(f"No {CHECKPOINT_NAME} in {run_dir}")
+        run_id = run_dir.name.removeprefix("run_")
+        print(f"Run dir: {run_dir}  (RESUME)")
+    else:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = snapshots_root / f"run_{run_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Run dir: {run_dir}")
 
     # --- Data ---
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
@@ -544,41 +647,88 @@ def train(
         "cli_argv": list(cli_argv) if cli_argv else [],
         "cardio_pairs_sha256": _sha256_file(csv_path) if csv_path.is_file() else None,
     }
-    (run_dir / "config.json").write_text(json.dumps(config, indent=2))
-    if cli_argv:
-        quoted = " ".join(shlex.quote(a) for a in cli_argv)
-        (run_dir / "RUN_COMMAND.txt").write_text(
-            f"{quoted}\n\n"
-            "# Powiel na innej maszynie (ten sam repo, ten sam cardio_pairs.csv po sha256).\n"
-        )
-
+    # --- Resume vs new run: write/load config + checkpoint ---
     log_path = run_dir / "log.csv"
-    log_path.write_text(
-        "epoch,train_loss,val_loss,val_infonce_n_mean,lr,elapsed_s\n"
-    )
-
-    # --- Snapshot epoch 0 (pre-training baseline) ---
-    print("\nSnapshot epoch 0 (pre-training)…")
-    _take_snapshot(
-        run_dir, 0, text_tower, signal_tower, dataset, val_idx, sim_indices,
-        batch_size, device,
-    )
-
-    # --- Training ---
+    start_epoch = 1
     best_val = float("inf")
     bad_epochs = 0
+
+    if is_resume:
+        ckpt_path = run_dir / CHECKPOINT_NAME
+        print(f"Loading checkpoint: {ckpt_path}")
+        ckpt = load_checkpoint(ckpt_path, device)
+
+        # Validate that we're not changing locked hyperparams
+        validate_resume_config(ckpt["config"], config, force=force)
+
+        # Update config in-place: keep checkpoint's locked fields, but allow
+        # epochs / max_time / patience to come from current CLI
+        config = {**ckpt["config"], "epochs": epochs, "training_preset": training_preset,
+                  "cli_argv": list(cli_argv) if cli_argv else ckpt["config"].get("cli_argv", [])}
+        (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+
+        text_tower.load_state_dict(ckpt["text_tower"])
+        signal_tower.load_state_dict(ckpt["signal_tower"])
+        text_tower.to(device)
+        signal_tower.to(device)
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        restore_rng(ckpt)
+
+        start_epoch = int(ckpt["epoch"]) + 1
+        best_val = float(ckpt["best_val"])
+        bad_epochs = int(ckpt["bad_epochs"])
+
+        if start_epoch > epochs:
+            raise RuntimeError(
+                f"Checkpoint already at epoch {ckpt['epoch']} >= target {epochs}. "
+                f"Increase --epochs or use a different run dir."
+            )
+        print(f"  Resumed from epoch {ckpt['epoch']}; continuing {start_epoch}..{epochs} "
+              f"(best_val={best_val:.4f}, bad_epochs={bad_epochs})")
+
+        if cli_argv:
+            quoted = " ".join(shlex.quote(a) for a in cli_argv)
+            with (run_dir / "RUN_COMMAND.txt").open("a") as f:
+                f.write(f"\n# Resume session: {quoted}\n")
+    else:
+        (run_dir / "config.json").write_text(json.dumps(config, indent=2))
+        if cli_argv:
+            quoted = " ".join(shlex.quote(a) for a in cli_argv)
+            (run_dir / "RUN_COMMAND.txt").write_text(
+                f"{quoted}\n\n"
+                "# Powiel na innej maszynie (ten sam repo, ten sam cardio_pairs.csv po sha256).\n"
+            )
+        log_path.write_text(
+            "epoch,train_loss,val_loss,val_infonce_n_mean,lr,elapsed_s\n"
+        )
+
+        # Snapshot epoch 0 (pre-training baseline) — only for fresh run
+        print("\nSnapshot epoch 0 (pre-training)…")
+        _take_snapshot(
+            run_dir, 0, text_tower, signal_tower, dataset, val_idx, sim_indices,
+            batch_size, device,
+        )
+
+    # --- Training ---
     effective_batch = batch_size * grad_accum_steps
-    print(f"\nTraining for {epochs} epochs | train={len(train_idx)} val={len(val_idx)} "
+    print(f"\nTraining epochs {start_epoch}..{epochs} | train={len(train_idx)} val={len(val_idx)} "
           f"| batch={batch_size} × accum={grad_accum_steps} = effective {effective_batch} "
           f"| InfoNCE baseline = ln({effective_batch}) = {np.log(effective_batch):.3f}\n"
           f"| val_loss_mode={val_loss_mode} (macro aligns val InfoNCE batching with train)\n")
+
+    # Wall-clock budget for partial training across sessions
+    session_start = time.time()
+    max_seconds = float(max_time_hours) * 3600.0 if max_time_hours else float("inf")
+    stopped_by_max_time = False
 
     # When grad_accum > 1, we collect z_text/z_signal across micro-batches and
     # compute InfoNCE on the concatenated tensor — that is what makes
     # gradient accumulation a real "larger batch" for contrastive losses
     # (naive accumulation of per-microbatch InfoNCE would NOT enlarge the
     # negative pool, only smooth the gradient).
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         text_tower.train()
         signal_tower.train()
 
@@ -596,10 +746,11 @@ def train(
             item_ids = batch["item_ids"].to(device, non_blocking=True)
             values = batch["values"].to(device, non_blocking=True)
             signal_mask = batch["signal_mask"].to(device, non_blocking=True)
+            hours = batch["hours"].to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
                 z_text = text_tower(input_ids, attention_mask)
-                z_signal = signal_tower(item_ids, values, signal_mask)
+                z_signal = signal_tower(item_ids, values, signal_mask, hours)
 
             z_text_buf.append(z_text)
             z_sig_buf.append(z_signal)
@@ -665,7 +816,7 @@ def train(
             batch_size, device,
         )
 
-        # Early stopping
+        # Early stopping (must update best_val/bad_epochs BEFORE saving checkpoint)
         if val_loss < best_val - 1e-4:
             best_val = val_loss
             bad_epochs = 0
@@ -673,11 +824,43 @@ def train(
             torch.save(signal_tower.state_dict(), run_dir / "best_signal_tower.pt")
         else:
             bad_epochs += 1
-            if bad_epochs >= early_stop_patience:
-                print(f"Early stopping at epoch {epoch} (no val improvement for {early_stop_patience} epochs).")
-                break
 
-    # --- Final artifacts ---
+        # Save full resume-checkpoint (overwrites previous epoch's checkpoint)
+        save_checkpoint(
+            run_dir / CHECKPOINT_NAME,
+            text_tower=text_tower.state_dict(),
+            signal_tower=signal_tower.state_dict(),
+            optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict(),
+            scaler=scaler.state_dict(),
+            epoch=epoch,
+            best_val=best_val,
+            bad_epochs=bad_epochs,
+            config=config,
+            **collect_rng_state(),
+        )
+
+        if bad_epochs >= early_stop_patience:
+            print(f"Early stopping at epoch {epoch} (no val improvement for {early_stop_patience} epochs).")
+            break
+
+        # Wall-clock budget check (graceful stop, checkpoint already saved)
+        if time.time() - session_start >= max_seconds:
+            stopped_by_max_time = True
+            elapsed_h = (time.time() - session_start) / 3600.0
+            print(f"\n[max-time] Stopped after {elapsed_h:.2f}h (limit {max_time_hours}h).")
+            print(f"[max-time] Resume next session with:")
+            print(f"           uv run python -m src.training.train_contrastive "
+                  f"--resume {run_dir} --epochs {epochs}"
+                  + (f" --max-time-hours {max_time_hours}" if max_time_hours else ""))
+            break
+
+    # --- Final artifacts (skip if stopped by --max-time-hours; resume + finish later) ---
+    if stopped_by_max_time:
+        print(f"\n[max-time] Skipping final node_embeddings export (incomplete training).")
+        print(f"[max-time] Resume to finish — final artifacts will be exported then.")
+        return run_dir
+
     torch.save(text_tower.state_dict(), run_dir / "final_text_tower.pt")
     torch.save(signal_tower.state_dict(), run_dir / "final_signal_tower.pt")
 
@@ -780,6 +963,30 @@ def _parse_args() -> argparse.Namespace:
         default="none",
         help="low-data-bert: freeze BERT, lr_bert=0, lr_head=2e-4, accum=4 if defaults unchanged.",
     )
+    p.add_argument(
+        "--csv-path",
+        type=str,
+        default=None,
+        help="Override input pairs CSV (default: data/processed/cardio_pairs.csv). "
+             "Use e.g. data/processed/pairs_all-icus_note_level.csv for full MIMIC.",
+    )
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume training from checkpoint.pt in this run dir (continues in same dir).",
+    )
+    p.add_argument(
+        "--max-time-hours",
+        type=float,
+        default=None,
+        help="Stop cleanly after this many wall-clock hours. Resume command printed.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="On --resume: allow continuing despite locked-hyperparam mismatch.",
+    )
     return p.parse_args()
 
 
@@ -789,8 +996,14 @@ if __name__ == "__main__":
         apply_training_preset(args)
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+    csv_path = (
+        Path(args.csv_path).resolve()
+        if args.csv_path
+        else PROJECT_ROOT / "data" / "processed" / "cardio_pairs.csv"
+    )
+
     train(
-        csv_path=PROJECT_ROOT / "data" / "processed" / "cardio_pairs.csv",
+        csv_path=csv_path,
         snapshots_root=PROJECT_ROOT / "data" / "snapshots",
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -809,4 +1022,7 @@ if __name__ == "__main__":
         val_loss_mode=args.val_loss_mode,
         training_preset=args.preset,
         cli_argv=sys.argv,
+        resume_from=args.resume,
+        max_time_hours=args.max_time_hours,
+        force=args.force,
     )

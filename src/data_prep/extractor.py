@@ -45,6 +45,13 @@ CARDIO_UNITS = [
     "Cardiovascular Intensive Care Unit (CVICU)",
 ]
 
+# Cohort presets: None means "no filter — use all ICU types".
+COHORT_PRESETS: dict[str, list[str] | None] = {
+    "cardio":   CARDIO_UNITS,
+    "all-icus": None,
+}
+DEFAULT_COHORT = "cardio"
+
 # ---------------------------------------------------------------------------
 # Signal catalog – 7 vitals + 7 labs, mapped to a contiguous item_type_id
 # ---------------------------------------------------------------------------
@@ -108,17 +115,26 @@ _DT_FMT = "%Y-%m-%d %H:%M:%S"
 # ---------------------------------------------------------------------------
 # Step 1 – Cardio cohort + in-hospital mortality label
 # ---------------------------------------------------------------------------
-def load_cohort() -> pl.DataFrame:
+def load_cohort(cohort: str = DEFAULT_COHORT) -> pl.DataFrame:
     """
-    Loads ICU stays for CCU/CVICU and joins in-hospital mortality from
-    `admissions.hospital_expire_flag` (true in-hospital death indicator).
+    Loads ICU stays for the given cohort preset and joins in-hospital mortality
+    from ``admissions.hospital_expire_flag``.
+
+    Args:
+        cohort: key into ``COHORT_PRESETS`` — ``"cardio"`` for CCU/CVICU only,
+                ``"all-icus"`` to skip the unit filter and take every ICU stay.
 
     Returns columns:
         subject_id, hadm_id, stay_id, first_careunit, intime, outtime, mortality
     """
+    if cohort not in COHORT_PRESETS:
+        raise ValueError(f"Unknown cohort {cohort!r}; expected one of {list(COHORT_PRESETS)}")
+    units = COHORT_PRESETS[cohort]
+    icustays_lf = pl.scan_csv(MIMIC_BASE / "icu" / "icustays.csv.gz")
+    if units is not None:
+        icustays_lf = icustays_lf.filter(pl.col("first_careunit").is_in(units))
     icustays_lf = (
-        pl.scan_csv(MIMIC_BASE / "icu" / "icustays.csv.gz")
-        .filter(pl.col("first_careunit").is_in(CARDIO_UNITS))
+        icustays_lf
         .with_columns(
             pl.col("intime").str.to_datetime(_DT_FMT, strict=False),
             pl.col("outtime").str.to_datetime(_DT_FMT, strict=False),
@@ -136,7 +152,7 @@ def load_cohort() -> pl.DataFrame:
         )
     )
 
-    cohort = (
+    cohort_df = (
         icustays_lf
         .join(admissions_lf, on="hadm_id", how="left")
         .with_columns(
@@ -150,11 +166,11 @@ def load_cohort() -> pl.DataFrame:
     )
 
     print(
-        f"  Cohort: {len(cohort)} stays | "
-        f"mortality rate (in-hospital): {cohort['mortality'].mean():.1%} | "
-        f"unique subjects: {cohort['subject_id'].n_unique()}"
+        f"  Cohort [{cohort}]: {len(cohort_df)} stays | "
+        f"mortality rate (in-hospital): {cohort_df['mortality'].mean():.1%} | "
+        f"unique subjects: {cohort_df['subject_id'].n_unique()}"
     )
-    return cohort
+    return cohort_df
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +237,7 @@ def load_vitals(cohort: pl.DataFrame) -> pl.DataFrame:
         .drop_nulls("valuenum")
         .join(itemid_lookup, on="itemid", how="inner")
         .rename({"charttime": "event_time"})
-        .select(["stay_id", "event_time", "signal_name", "valuenum"])
+        .select(["stay_id", "event_time", "signal_name", "valuenum", "intime"])
         .collect()
     )
 
@@ -268,7 +284,7 @@ def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
         )
         .join(itemid_lookup, on="itemid", how="inner")
         .rename({"charttime": "event_time"})
-        .select(["stay_id", "event_time", "signal_name", "valuenum"])
+        .select(["stay_id", "event_time", "signal_name", "valuenum", "intime"])
         .collect()
     )
 
@@ -364,7 +380,15 @@ def pair_notes_signals(
             .clip(norm_lo, norm_hi)
             .alias("norm_value"),
         type_id_expr.alias("item_type_id"),
-    )
+        # Hours from ICU admission (intime). Clipped to [0, 24] — the 24h
+        # extraction window guarantees this range, but clip keeps it explicit
+        # for downstream normalization.
+        ((pl.col("event_time") - pl.col("intime"))
+            .dt.total_seconds() / 3600.0)
+            .clip(pl.lit(0.0, dtype=pl.Float32), pl.lit(24.0, dtype=pl.Float32))
+            .cast(pl.Float32)
+            .alias("event_hours_from_intime"),
+    ).drop("intime")  # not needed in final CSV
 
     print(f"  Pairs: {len(paired)} (note × signal) rows")
     return paired
@@ -373,13 +397,24 @@ def pair_notes_signals(
 # ---------------------------------------------------------------------------
 # Step 5 – Full pipeline
 # ---------------------------------------------------------------------------
+def pairs_filename(cohort: str, pair_strategy: str) -> str:
+    """Canonical CSV name per (cohort, strategy) so different runs don't overwrite."""
+    return f"pairs_{cohort}_{pair_strategy}.csv"
+
+
+def metadata_filename(cohort: str, pair_strategy: str) -> str:
+    return f"signal_metadata_{cohort}_{pair_strategy}.json"
+
+
 def write_signal_metadata(
     output_dir: Path,
     *,
+    cohort: str | None = None,
     pair_strategy: str | None = None,
     pair_window_hours: float | None = None,
+    out_name: str = "signal_metadata.json",
 ) -> None:
-    """Writes signal_metadata.json so downstream code knows item_type_id mapping."""
+    """Writes signal metadata so downstream code knows item_type_id mapping."""
     meta: dict = {
         "n_signal_types": len(ALL_SIGNAL_NAMES),
         "signal_names": ALL_SIGNAL_NAMES,
@@ -388,11 +423,13 @@ def write_signal_metadata(
         "vitals_catalog": VITALS_CATALOG,
         "labs_catalog": LABS_CATALOG,
     }
+    if cohort is not None:
+        meta["cohort"] = cohort
     if pair_strategy is not None:
         meta["pair_strategy"] = pair_strategy
     if pair_window_hours is not None:
         meta["pair_window_hours"] = pair_window_hours
-    out = output_dir / "signal_metadata.json"
+    out = output_dir / out_name
     out.write_text(json.dumps(meta, indent=2))
     print(f"  Wrote signal metadata → {out}")
 
@@ -400,31 +437,39 @@ def write_signal_metadata(
 def run_extraction(
     toy: bool = False,
     *,
+    cohort: str = DEFAULT_COHORT,
     pair_strategy: str = PAIR_STRATEGY_NOTE,
     pair_window_hours: float = 2.0,
+    output_name: str | None = None,
+    metadata_name: str | None = None,
 ) -> pl.DataFrame:
     """
-    Runs the full extraction pipeline and writes:
-      - data/processed/cardio_pairs.csv  (note × signal pairs)
-      - data/processed/signal_metadata.json
+    Runs the full extraction pipeline.
+
+    Output files (default names depend on cohort + strategy so different
+    extractions don't overwrite each other):
+      - data/processed/pairs_<cohort>_<strategy>.csv
+      - data/processed/signal_metadata_<cohort>_<strategy>.json
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = PROCESSED_DIR / "cardio_pairs.csv"
+    csv_name = output_name or pairs_filename(cohort, pair_strategy)
+    meta_name = metadata_name or metadata_filename(cohort, pair_strategy)
+    output_path = PROCESSED_DIR / csv_name
 
-    print("[1/5] Loading cardio cohort...")
-    cohort = load_cohort()
+    print(f"[1/5] Loading cohort [{cohort}]...")
+    cohort_df = load_cohort(cohort)
     if toy:
-        cohort = cohort.head(1000)
-        print(f"  [toy mode] trimmed to {len(cohort)} stays")
+        cohort_df = cohort_df.head(1000)
+        print(f"  [toy mode] trimmed to {len(cohort_df)} stays")
 
     print("[2/5] Loading radiology notes (24 h window, with leakage filter)...")
-    notes = load_notes(cohort)
+    notes = load_notes(cohort_df)
 
     print("[3/5] Scanning chartevents for vitals (7 itemids)...")
-    vitals = load_vitals(cohort)
+    vitals = load_vitals(cohort_df)
 
     print("[4/5] Scanning labevents for labs (7 itemids)...")
-    labs = load_labs(cohort)
+    labs = load_labs(cohort_df)
 
     print("[5/5] Pairing notes ↔ signals...")
     signals = pl.concat([vitals, labs], how="vertical")
@@ -436,7 +481,7 @@ def run_extraction(
     )
 
     pairs = pairs.join(
-        cohort.select(["stay_id", "subject_id", "first_careunit", "mortality"]),
+        cohort_df.select(["stay_id", "subject_id", "first_careunit", "mortality"]),
         on="stay_id",
         how="left",
     )
@@ -444,12 +489,16 @@ def run_extraction(
     pairs.write_csv(output_path)
     write_signal_metadata(
         PROCESSED_DIR,
+        cohort=cohort,
         pair_strategy=pair_strategy,
         pair_window_hours=pair_window_hours,
+        out_name=meta_name,
     )
 
     print(
         f"\nSaved {len(pairs):,} pairs → {output_path}\n"
+        f"  cohort:        {cohort}\n"
+        f"  pair_strategy: {pair_strategy}\n"
         f"  unique notes:  {pairs['note_id'].n_unique()}\n"
         f"  unique stays:  {pairs['stay_id'].n_unique()}\n"
         f"  unique subj:   {pairs['subject_id'].n_unique()}\n"
@@ -462,11 +511,17 @@ def run_extraction(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="MIMIC CCU/CVICU → cardio_pairs.csv")
+    parser = argparse.ArgumentParser(description="MIMIC → pairs CSV (cohort + strategy aware)")
     parser.add_argument(
         "--full",
         action="store_true",
         help="Use full cohort (default: toy subset of 1000 stays)",
+    )
+    parser.add_argument(
+        "--cohort",
+        choices=tuple(COHORT_PRESETS.keys()),
+        default=DEFAULT_COHORT,
+        help="cardio = CCU+CVICU only; all-icus = no unit filter (full MIMIC ICU)",
     )
     parser.add_argument(
         "--pair-strategy",
@@ -480,9 +535,17 @@ if __name__ == "__main__":
         default=2.0,
         help="Half-width in hours for note_level pairing (ignored for stay_level)",
     )
+    parser.add_argument(
+        "--output-name",
+        type=str,
+        default=None,
+        help="Override output CSV name (default: pairs_<cohort>_<strategy>.csv)",
+    )
     args = parser.parse_args()
     run_extraction(
         toy=not args.full,
+        cohort=args.cohort,
         pair_strategy=args.pair_strategy,
         pair_window_hours=args.pair_window_hours,
+        output_name=args.output_name,
     )

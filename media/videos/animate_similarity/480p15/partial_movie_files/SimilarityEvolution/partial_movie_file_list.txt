@@ -1,6 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe/GGSN_Projektowe/media/videos/animate_similarity/480p15/partial_movie_files/SimilarityEvolution/1584795214_211050033_223132457.mp4'
-file 'file:/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe/GGSN_Projektowe/media/videos/animate_similarity/480p15/partial_movie_files/SimilarityEvolution/4072820271_3268744812_148700337.mp4'
-file 'file:/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe/GGSN_Projektowe/media/videos/animate_similarity/480p15/partial_movie_files/SimilarityEvolution/4072820271_3932249147_363619353.mp4'
-file 'file:/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe/GGSN_Projektowe/media/videos/animate_similarity/480p15/partial_movie_files/SimilarityEvolution/4072820271_626301618_1070751241.mp4'
-file 'file:/home/jan_b/Semestr6/Glebokie_i_grafowe_sieci_neuronowe/GGSN_Projektowe/media/videos/animate_similarity/480p15/partial_movie_files/SimilarityEvolution/4072820271_2536175139_91106788.mp4'

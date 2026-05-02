@@ -76,13 +76,16 @@ class TextTower(nn.Module):
 # ---------------------------------------------------------------------------
 class SignalTower(nn.Module):
     """
-    Encodes a sequence of (item_type_id, normalised_value) clinical events.
+    Encodes a sequence of (item_type_id, normalised_value, hours) clinical events.
 
     Forward inputs:
         item_ids: (B, seq_len) long, values in [0, num_item_types)
         values:   (B, seq_len) float in [0, 1]
         mask:     (B, seq_len) float, 1 for real events, 0 for padding
                   (optional — used to zero out padded positions before pooling)
+        hours:    (B, seq_len) float in [0, 1] — event time in hours / 24,
+                  i.e. position in 24h ICU window. None falls back to "no time
+                  encoding" for backward compat with old models / datasets.
 
     Forward output:
         (B, embed_dim) L2-normalised embedding.
@@ -93,12 +96,15 @@ class SignalTower(nn.Module):
         num_item_types: int = NUM_SIGNAL_TYPES,
         type_embed_dim: int = TYPE_EMBED_DIM,
         embed_dim: int = EMBED_DIM,
+        use_hours: bool = True,
     ) -> None:
         super().__init__()
 
         self.type_embed = nn.Embedding(num_item_types, type_embed_dim)
+        self.use_hours = use_hours
 
-        in_channels = type_embed_dim + 1  # type_embed concatenated with scalar value
+        # type_embed + value (+ hours if enabled)
+        in_channels = type_embed_dim + 1 + (1 if use_hours else 0)
         self.encoder = nn.Sequential(
             nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm1d(64),
@@ -121,9 +127,17 @@ class SignalTower(nn.Module):
         item_ids: torch.Tensor,
         values: torch.Tensor,
         mask: torch.Tensor | None = None,
+        hours: torch.Tensor | None = None,
     ) -> torch.Tensor:
         type_emb = self.type_embed(item_ids)                      # (B, L, type_embed_dim)
-        x = torch.cat([type_emb, values.unsqueeze(-1)], dim=-1)   # (B, L, type_embed_dim+1)
+        chans = [type_emb, values.unsqueeze(-1)]
+        if self.use_hours:
+            if hours is None:
+                # Backward compat: caller didn't pass hours but model expects it
+                # → use zeros. Loss still works, just no time signal.
+                hours = torch.zeros_like(values)
+            chans.append(hours.unsqueeze(-1))
+        x = torch.cat(chans, dim=-1)                               # (B, L, in_channels)
         x = x.transpose(1, 2)                                      # (B, C, L)
         h = self.encoder(x)                                        # (B, 128, L)
 
