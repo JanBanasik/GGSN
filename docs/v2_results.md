@@ -132,8 +132,27 @@ pasować do downstream task. Zostajemy z note-level (v2/v4) jako właściwą gra
 `data/embeddings/` zawiera v3 stay-level embeddingi (z overnight run 20260505_213819).
 **Nie używamy ich do Fazy 2.** Canonical dla Fazy 2 = **v4 note-level** (do wytrenowania).
 
-Embeddingi z v2 pretrain (run_193437): `data/snapshots/run_20260504_193437/best_text_tower.pt`.
-To jest tymczasowy fallback przed ukończeniem v4.
+Canonical dla Fazy 2: `data/embeddings/` = **v4 note-level** (run_20260512_200632, ep.16).
+
+---
+
+## v4 — Note-level + Δt + re-ekstrakcja (2026-05-12/13) ✅
+
+**Setup**: note-level pairing z Δt jako 4. kanałem SignalTower, eff. batch 64, τ=0.07, max_text_len=256, seq_len=64.
+Run `20260512_200632`: early stopping ep.21, best val **2.980** (ep.16).
+
+| Metryka | Wartość |
+|---|---|
+| Plik | `pairs_all-icus_note_level.csv` (nowa ekstrakcja z Δt) |
+| Notatki | 102 221 |
+| Stays | 52 727 |
+| Best val | **2.980** (ep. 16/21) |
+| Baseline ln(64) | 4.159 |
+| **% redukcji** | **28.3%** (+1.7 pp vs v2 bez Δt) |
+| Linear probe AUROC | **0.730** (5-fold CV, val set) |
+| Diagonal gap | 0.105 → **0.811** (×7.7 po treningu) |
+
+To są embeddingi wejściowe do Fazy 2 GNN.
 
 ---
 
@@ -144,8 +163,8 @@ To jest tymczasowy fallback przed ukończeniem v4.
 | v0 PoC | manual | cardio toy | note ±2h | ❌ | 8 | 1.418 | 2.08 | 31.7% (artefakt skali) |
 | v1 #1 | 224518 | cardio full | note ±2h | ❌ | 16 | 2.515 | 2.77 | 9.2% |
 | v1 #2 | 011739 | cardio full | note ±2h | ❌ | 16 | **2.493** | 2.77 | **9.9%** |
-| v2 pretrain | 193437 | all-icus | note ±2h | ❌ | 64 | **3.054** | 4.16 | **26.6%** ⭐ |
+| v2 pretrain | 193437 | all-icus | note ±2h | ❌ | 64 | 3.054 | 4.16 | 26.6% |
 | v2 hard-neg #1 | 193437 ep.14+ | all-icus | note ±2h | ❌ | 64 | 4.56 | 4.16 | −9.7% (catastrophic) |
 | v2 hard-neg #2 | 131540 | all-icus | note ±2h | ❌ | 64 | 3.135 | 4.16 | 24.6% (brak boost) |
-| v3 stay-level | 213819 | all-icus | **stay_level** | ✅ | 64 | 2.471 | 4.16 | 40.6% (zły cel) |
-| **v4 note-level** | TBD | all-icus | **note ±2h** | ✅ | **128** | target ~3.4 | 4.85 | target ~30% |
+| v3 stay-level | 213819 | all-icus | stay_level | ✅ | 64 | 2.471 | 4.16 | 40.6% (zła granularność) |
+| **v4 note-level** ⭐ | **200632** | all-icus | **note ±2h** | ✅ | 64 | **2.980** | 4.16 | **28.3%** → Phase 2 |
