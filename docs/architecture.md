@@ -1,7 +1,19 @@
 # Architektura Systemu – Temporal GNN + Contrastive Learning
 
 Poniższe diagramy opisują pełen pipeline predykcji śmiertelności szpitalnej
-na danych MIMIC-IV (pierwsze 24h pobytu na CCU/CVICU).
+na danych MIMIC-IV (pierwsze 24h pobytu).
+
+> **Status (2026-05-12)**: dokument zaktualizowany do stanu v4 (aktualny kierunek).
+> Faza 1 używa **note-level pairing** — każda notatka = osobna para z sygnałami ±2h.
+> Stay-level (v3) było testem który poprawił InfoNCE ale miał złą granularność dla Fazy 2.
+> Pełna historia eksperymentów: [v2_results.md](v2_results.md).
+>
+> Główne różnice względem PoC v0:
+> - **Cohort**: `--cohort all-icus` (pełny ICU MIMIC-IV, 52 727 stays, 102k notatek)
+> - **Pairing**: `--pair-strategy note_level` — note-level granularity dla węzłów grafu
+> - **Mortality**: `admissions.hospital_expire_flag` (in-hospital), nie `patients.dod`
+> - **Sygnały**: 14 typów (7 vital + 7 lab) zamiast 2 (HR + BP)
+> - **SignalTower input**: 4 kanały — `(item_type_embed, value, hours_from_intime, delta_to_note)`
 
 ---
 
@@ -15,15 +27,18 @@ na danych MIMIC-IV (pierwsze 24h pobytu na CCU/CVICU).
 │  icu/chartevents.csv.gz                                                 │
 └───────────────────────┬─────────────────────────────────────────────────┘
                         │  src/data_prep/extractor.py
-                        │  ├── load_cohort()      → CCU/CVICU stays + mortality
-                        │  ├── load_notes()       → notatki w oknie [t₀, t₀+24h]
-                        │  ├── load_vitals()      → HR(220045) + BP(220181)
-                        │  └── pair_notes_vitals()→ pary w oknie ±2h
+                        │  ├── load_cohort(cohort)  → CCU/CVICU lub all-icus + mortality
+                        │  ├── load_notes()         → radiology notes [t₀, t₀+24h] + cleaner
+                        │  ├── load_vitals()        → 7 vital itemids (HR, BP×3, SpO2, RR, Temp)
+                        │  ├── load_labs()          → 7 lab itemids (Trop, BNP, Cr, Lac, K, Hgb, WBC)
+                        │  └── pair_notes_signals(strategy) → note_level (±2h) lub stay_level (24h concat)
                         ▼
-              ┌─────────────────────┐
-              │  cardio_pairs.csv   │  ← 7 235 par (855 unikalnych notatek)
-              │  (data/processed/)  │     483 stay_id, mortality rate ~X%
-              └──────────┬──────────┘
+              ┌────────────────────────────────────┐
+              │  pairs_<cohort>_<strategy>.csv     │  ← cardio_note: 9 749 notek / 314k par
+              │  (data/processed/)                 │     all-icus_note: 102k notek / 3.49M par
+              │                                    │     all-icus_stay: 53 380 stays / 9.53M par
+              │                                    │     mortality (in-hosp): 12.5-15.2%
+              └────────────────────┬───────────────┘
                          │
           ┌──────────────┴──────────────┐
           │                             │
@@ -53,7 +68,7 @@ na danych MIMIC-IV (pierwsze 24h pobytu na CCU/CVICU).
                          ▼
               ┌──────────────────────┐
               │  node_embeddings.pt  │  ← {note_id → Tensor(128,)}
-              │  (data/embeddings/)  │     855 wektorów węzłów
+              │  (data/embeddings/)  │     v2: 9 749–102 221 wektorów (cohort-zależne)
               └──────────┬───────────┘
                          │
           FAZA 2: Temporal Graph Neural Network (supervised)
@@ -125,21 +140,24 @@ WEJŚCIE: jeden batch B = 8 par (notatka_i, sygnał_i)
 ║  └──────────────────────┬──────────────────────┘    ║
 ║                         │ (B, 128)                   ║
 ║  ┌──────────────────────▼──────────────────────┐    ║
-║  │  1D CNN Encoder                             │    ║
+║  │  1D CNN Encoder (v3)                        │    ║
 ║  │                                             │    ║
-║  │  Input: (B, seq=32, 2)                      │    ║
-║  │    ch0: item_type ∈ {0.0=HR, 1.0=BP}       │    ║
-║  │    ch1: norm_value ∈ [0, 1]                │    ║
+║  │  Input: 4 channels × seq_len events         │    ║
+║  │    ch0..7: type_embed = nn.Embedding(14, 8) │    ║
+║  │    ch8:    norm_value ∈ [0, 1]             │    ║
+║  │    ch9:    hours_from_intime ∈ [0, 1]      │    ║
+║  │    ch10:   delta_to_note (clipped /24)     │    ║
 ║  │                                             │    ║
-║  │  Transpose → (B, 2, 32)                    │    ║
-║  │  Conv1d(2→64,  k=3) → BN → ReLU           │    ║
+║  │  Transpose → (B, 11, seq_len)              │    ║
+║  │  Conv1d(11→64,  k=3) → BN → ReLU          │    ║
 ║  │  Conv1d(64→128, k=5) → BN → ReLU          │    ║
 ║  │  Conv1d(128→128,k=3) → BN → ReLU          │    ║
-║  │  AdaptiveAvgPool1d(1) → (B, 128)           │    ║
+║  │  Masked-mean pool → (B, 128)               │    ║
 ║  └─────────────────────────────────────────────┘    ║
 ║                                                      ║
-║  Wejście: (B, seq_len, 2) – vitale posortowane       ║
-║           czasowo, padding zerami                    ║
+║  seq_len: 64 (note_level) | 128 (stay_level)         ║
+║  14 typów: HR, BP_mean/sys/dia, SpO2, RR, Temp,      ║
+║           Trop_I, NTproBNP, Cr, Lac, K, Hgb, WBC     ║
 ║                                                      ║
 ║                   SIGNAL TOWER                       ║
 ╚══════════════════════════════════════════════════════╝
@@ -163,19 +181,22 @@ InfoNCE Loss (NT-Xent, temperature τ=0.07):
 ## Diagram 3 – Faza 2: Temporal GNN (szczegółowo)
 
 ```
-WEJŚCIE: jeden pacjent (stay_id) z N zdarzeniami klinicznych
+WEJŚCIE: jeden pacjent (stay_id), ~54 zdarzeń (mediana), posortowanych chronologicznie
 
-  Zdarzenia posortowane chronologicznie:
-  event₀(t=0h) → event₁(t=3h) → event₂(t=7h) → event₃(t=18h)
+  ~52 pomiary sygnałów + ~2 notatki kliniczne w oknie 24h
 
-  Każdy węzeł:
-  x_i = embedding z Fazy 1 (128-D, zamrożony)
+  Węzły dwóch typów:
+  ┌─ Signal node (~52/stay) ─────────────────────────────────────────┐
+  │  [item_type_id → Embedding(14,8)] ++ [norm_value] ++ [hours/24]  │
+  │  → Linear(10 → 64) → z_sig ∈ R^64                               │
+  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Note node (~2/stay) ────────────────────────────────────────────┐
+  │  text → text_tower(frozen, Faza 1) → 128-D                       │
+  │  → Linear(128 → 64) → z_note ∈ R^64                             │
+  └──────────────────────────────────────────────────────────────────┘
 
-  Krawędzie skierowane (chronologiczne):
-  edge (i→j) istnieje gdy i < j (lub tylko i→i+1 dla łańcucha)
-
-  Edge attributes (kluczowy element T-GNN!):
-  edge_attr[i→j] = Δt[i,j] = t_j - t_i   [w godzinach]
+  Krawędzie skierowane (chronologiczne): edge (i→j) dla wszystkich i < j
+  Edge attributes: edge_attr[i→j] = (t_j - t_i) / 24   [znormalizowane godziny]
 
 ╔══════════════════════════════════════════════════════╗
 ║              TEMPORAL GNN (T-GNN)                    ║
@@ -183,31 +204,31 @@ WEJŚCIE: jeden pacjent (stay_id) z N zdarzeniami klinicznych
 ║                                                      ║
 ║  Input Graph per patient:                            ║
 ║  ┌───────────────────────────────────────────────┐  ║
-║  │  x:          (N, 128)  node embeddings        │  ║
+║  │  x:          (N, 64)   node features          │  ║
 ║  │  edge_index: (2, E)    directed edges         │  ║
-║  │  edge_attr:  (E, 1)    Δt in hours            │  ║
+║  │  edge_attr:  (E, 1)    Δt/24 (normalized)     │  ║
 ║  └──────────────────────┬────────────────────────┘  ║
 ║                         │                            ║
 ║  ┌──────────────────────▼────────────────────────┐  ║
 ║  │  GINEConv Layer 1  (supports edge_attr!)      │  ║
 ║  │  h_i = MLP([h_i + Σⱼ∈N(i) (h_j + W·e_ij)])  │  ║
-║  │  → ReLU → (N, 256)                           │  ║
+║  │  → ReLU → (N, 128)                           │  ║
 ║  └──────────────────────┬────────────────────────┘  ║
 ║                         │                            ║
 ║  ┌──────────────────────▼────────────────────────┐  ║
-║  │  GINEConv Layer 2                             │  ║
-║  │  → ReLU → (N, 256)                           │  ║
+║  │  GINEConv Layer 2 + Layer 3                   │  ║
+║  │  → ReLU → (N, 128)                           │  ║
 ║  └──────────────────────┬────────────────────────┘  ║
 ║                         │                            ║
 ║  ┌──────────────────────▼────────────────────────┐  ║
 ║  │  Global Mean Pooling                          │  ║
-║  │  (N, 256) → (1, 256)  jeden wektor na pacjenta│  ║
+║  │  (N, 128) → (1, 128)  jeden wektor na pacjenta│  ║
 ║  └──────────────────────┬────────────────────────┘  ║
 ║                         │                            ║
 ║  ┌──────────────────────▼────────────────────────┐  ║
 ║  │  Classifier Head                              │  ║
-║  │  Linear(256→64) → ReLU → Dropout(0.3)        │  ║
-║  │  → Linear(64→1) → Sigmoid                    │  ║
+║  │  Linear(128→32) → ReLU → Dropout(0.3)        │  ║
+║  │  → Linear(32→1) → Sigmoid                    │  ║
 ║  └──────────────────────┬────────────────────────┘  ║
 ║                         │                            ║
 ║                P(mortality) ∈ [0, 1]                 ║
@@ -232,10 +253,11 @@ GGSN_Projektowe/
 ├── data/
 │   ├── raw/              ← surowe CSV z MIMIC (gitignored)
 │   ├── processed/
-│   │   └── cardio_pairs.csv   (7 235 par, wyjście ekstraktora)
+│   │   ├── pairs_<cohort>_<strategy>.csv   (cohort-aware output, zawiera event_hours_from_intime + delta_hours_to_note)
+│   │   └── signal_metadata_<cohort>_<strategy>.json
 │   └── embeddings/
-│       ├── node_embeddings.pt  (855 wektorów 128-D, wejście GNN)
-│       ├── text_tower.pt       (wagi TextTower po Fazie 1)
+│       ├── node_embeddings.pt  (v3 stay-level, tylko referencja; wejście GNN = v4 note-level)
+│       ├── text_tower.pt       (wagi TextTower po Fazie 1 — po v4: aktualizować)
 │       └── signal_tower.pt
 │
 ├── src/
@@ -251,6 +273,8 @@ GGSN_Projektowe/
 │   │
 │   ├── training/
 │   │   ├── train_contrastive.py → CardiacPairsDataset, info_nce_loss, train()
+│   │   ├── hard_negatives.py    → HardNegativeBatchSampler (nie używamy aktywnie)
+│   │   ├── eval_embeddings.py   → linear probe AUROC, UMAP, diagonal gap
 │   │   └── train_gnn.py         → (TODO) GraphDataset, GNN training loop
 │   │
 │   └── utils/

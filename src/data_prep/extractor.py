@@ -388,6 +388,15 @@ def pair_notes_signals(
             .clip(pl.lit(0.0, dtype=pl.Float32), pl.lit(24.0, dtype=pl.Float32))
             .cast(pl.Float32)
             .alias("event_hours_from_intime"),
+        # Signed Δt between signal event and note (in hours). For note_level
+        # pairing this is bounded by ±pair_window_hours; for stay_level the
+        # synthetic note_time is the earliest real note in the stay so Δt is
+        # in [0, 24h] but typically small for early notes and growing for late
+        # signal events. Used by SignalTower as a 4th input channel.
+        ((pl.col("event_time") - pl.col("note_time"))
+            .dt.total_seconds() / 3600.0)
+            .cast(pl.Float32)
+            .alias("delta_hours_to_note"),
     ).drop("intime")  # not needed in final CSV
 
     print(f"  Pairs: {len(paired)} (note × signal) rows")

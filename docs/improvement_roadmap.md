@@ -30,6 +30,58 @@ Faza 1 została rozszerzona z PoC do "v1":
 
 ---
 
+## Aktualizacja po sesji 2026-05-04 / 05 (v2 wyniki)
+
+### Co zrobiliśmy
+- ✅ **Resume + checkpoint** (P0) — `--resume`, `--max-time-hours`, walidacja config-mismatch
+- ✅ **Full MIMIC cohort** (P0.1) — flag `--cohort {cardio, all-icus}`, output `pairs_<cohort>_<strategy>.csv`
+- ✅ **Time encoding `event_hours_from_intime`** (P0.4) — 3-ci kanał SignalTower
+- ✅ **Hard negative mining** (P0.3) — `HardNegativeBatchSampler` z M-anchors-per-batch + leakage guard
+- ✅ **val_loss_mode=macro** (P1.7) — spójność skali train/val przez buforowanie
+
+### Wyniki
+- **Pretrain note-level all-icus**: best val **3.054** (ep.11/13, run_20260504_193437) → **26.5% redukcji** vs baseline ln(64)=4.16
+- **vs v1 cardio (val 3.84, 7.8% redukcji)**: **3.4× lepsza redukcja**
+
+### Negative result: hard negatives **NIE pomagają** w obecnej formie
+**Dwie próby fine-tune z hard-neg na MIMIC-IV all-icus** (run_20260504_193437 + run_20260505_131540):
+
+| Próba | LR_BERT | pool | Val przed | Val po fine-tune | Werdykt |
+|---|---|---|---|---|---|
+| #1 (high-LR) | 4.6e-6 | 256 | 3.054 | **4.56** (ep.14) | catastrophic forgetting |
+| #2 (low-LR) | 5e-7 | 64 | 3.054 | **3.13-3.34** (ep.2-6) | brak boost, plateau gorszy niż pretrain |
+
+**Wnioski**:
+1. Hard-neg na cosine similarity wybiera **klinicznie podobne** notki (np. dwa CT klatki piersiowej różnych ICU pacjentów = naprawdę similar). Push-apart psuje semantykę.
+2. Subject_id leakage filter to za mało — potrzebujemy **ICD-10 / careunit-disjoint** filter.
+3. Top-K=64 vs K=256 — oba dają ten sam negative result.
+
+**Zalecenia P1/P2 dla hard-neg w przyszłości**:
+- **Smarter neg selection**: top-K per cosine ALE wykluczać kandydatów z podobnym `first_careunit` lub jednakowym ICD-10
+- **Cosine threshold dla "fake hard"**: include only neg where `cos(anchor, neg) < 0.7` (zbyt podobne = klinicznie ekwiwalent)
+- **Soft positives**: zamiast 0/1 labels w InfoNCE, użyć soft labels `0.3` dla notek z podobnym ICD-10
+- **Multi-view augmentation**: random text masking + signal jitter zamiast hard-neg
+
+### v4 note-level (następny krok, 2026-05-12+)
+
+Stay-level okazało się błędną granularnością — Faza 2 potrzebuje per-note embeddingów
+jako węzłów grafu. Wracamy do note-level z ulepszeniami z v3:
+
+1. ✅ **Δt jako 4. kanał SignalTower** — już w kodzie, wymaga re-ekstrakcji CSV
+2. ✅ **Effective batch 128** (batch=8 × grad_accum=8) — sprawdzone w v3
+3. ✅ **τ=0.07** — potwierdzone w v3 jako optymalne
+4. ⏳ **Re-ekstrakcja** `pairs_all-icus_note_level.csv` z kolumną `delta_hours_to_note`:
+   `uv run python -m src.data_prep.extractor --full --cohort all-icus --pair-strategy note_level`
+5. ⏳ **Trening v4 overnight** z `--max-text-len 256 --seq-len 64 --epochs 30`
+
+Pełny plan: `docs/phase2_implementation_plan.md`.
+
+**Caveat**: jeśli trening się sypnie (CUDA crash WSL2 lub OOM przy 512×128), wracamy do `--seq-len 64` lub `--max-text-len 256` z odpowiednią redukcją zakresu informacji.
+
+Pełna historia eksperymentów: [v2_results.md](v2_results.md).
+
+---
+
 ## Co zrobić do finalnego projektu (priorytety)
 
 ### P0 — must-have (krytyczne dla AUROC > 0.88 w Fazie 2)
