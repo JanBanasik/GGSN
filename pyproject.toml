@@ -17,6 +17,7 @@ dependencies = [
     "torch>=2.2.2,<2.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "torch>=2.6,<2.7; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     # transformers 5.5+ wymaga torch≥2.4; na Intel mac mamy torch 2.2.x.
+    "torch-geometric>=2.7.0",
     "transformers>=4.46,<5; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "transformers>=5.5.4; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
