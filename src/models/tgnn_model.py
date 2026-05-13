@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.nn.aggr import AttentionalAggregation
 
 from src.utils.graph_builder import NODE_DIM, NOTE_EMB_DIM, SIGNAL_RAW_DIM
 
@@ -21,10 +22,11 @@ from src.utils.graph_builder import NODE_DIM, NOTE_EMB_DIM, SIGNAL_RAW_DIM
 class TemporalPatientGNN(nn.Module):
     def __init__(
         self,
-        node_dim: int = NODE_DIM,   # 64
+        node_dim: int = NODE_DIM,       # 64
         hidden_dim: int = 128,
         n_layers: int = 3,
         dropout: float = 0.3,
+        pooling: str = "mean",          # "mean" | "attention"
     ):
         super().__init__()
 
@@ -46,6 +48,17 @@ class TemporalPatientGNN(nn.Module):
             self.convs.append(GINEConv(_mlp(hidden_dim, hidden_dim), edge_dim=1))
 
         self.drop = nn.Dropout(dropout)
+
+        # Pooling: mean or learned attention gate
+        self.pooling = pooling
+        if pooling == "attention":
+            self.pool = AttentionalAggregation(
+                gate_nn=nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim // 2),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim // 2, 1),
+                )
+            )
 
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, 32),
@@ -74,5 +87,9 @@ class TemporalPatientGNN(nn.Module):
             h = F.relu(conv(h, edge_index, edge_attr))
             h = self.drop(h)
 
-        g = global_mean_pool(h, batch)        # (B, hidden_dim)
+        if self.pooling == "attention":
+            g = self.pool(h, batch)
+        else:
+            g = global_mean_pool(h, batch)
+
         return self.classifier(g).squeeze(-1)  # (B,) logits

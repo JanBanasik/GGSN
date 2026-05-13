@@ -238,9 +238,10 @@ def train(args: argparse.Namespace) -> None:
 
     model = TemporalPatientGNN(
         node_dim=64,
-        hidden_dim=128,
+        hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
         dropout=args.dropout,
+        pooling=args.pooling,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n_params:,}")
@@ -349,8 +350,10 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.3)
+    p.add_argument("--pooling", default="mean", choices=["mean", "attention"])
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--train-ratio", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42)
