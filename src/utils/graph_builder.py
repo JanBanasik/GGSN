@@ -18,7 +18,8 @@ from torch_geometric.data import Data
 
 
 NODE_DIM = 64          # projected node feature dim (shared for both node types)
-SIGNAL_RAW_DIM = 10    # type_emb(8) + norm_value(1) + hours(1)
+SIGNAL_RAW_DIM = 10    # type_emb(8) + norm_value(1) + hours(1)  [frozen-emb mode]
+SIGNAL_VAL_DIM = 2     # norm_value(1) + hours(1)                [e2e mode]
 NOTE_EMB_DIM = 128     # text_tower output dim
 
 
@@ -124,5 +125,113 @@ def build_patient_graph(
 def load_note_embeddings(embeddings_path: Path) -> dict[str, torch.Tensor]:
     """Load {note_id -> Tensor(128,)} from Phase 1 export."""
     raw = torch.load(embeddings_path, map_location="cpu", weights_only=True)
-    # keys are "stay_XXXXX" in v4 (note_level still uses stay_id as key per dataset)
     return {k: v for k, v in raw.items()}
+
+
+def build_patient_graph_e2e(
+    stay_id: int,
+    note_rows: list[dict],
+    signal_rows: list[dict],
+) -> Data | None:
+    """
+    Build a temporal graph for end-to-end fine-tuning.
+
+    Note nodes carry pre-tokenised text tensors instead of pre-computed embeddings.
+    Signal nodes carry [norm_value, hours/24] as 2-D features plus item_type_id.
+
+    Args:
+        stay_id:     ICU stay identifier.
+        note_rows:   List of dicts with keys:
+                       note_id, note_time (float hours from intime),
+                       input_ids (Tensor[max_len] long),
+                       attn_mask (Tensor[max_len] long).
+        signal_rows: List of dicts with keys:
+                       norm_value, item_type_id, event_hours_from_intime.
+
+    Returns:
+        PyG Data with:
+            x              (N, 2)          signal: [norm_val, hours/24]; note: zeros
+            item_type_ids  (N,) long       signal type IDs; 0 for note nodes
+            note_input_ids (N_note, max_len) long
+            note_attn_mask (N_note, max_len) long
+            node_type      (N,) long       0=signal  1=note
+            timestamps     (N,) float
+            edge_index     (2, E)
+            edge_attr      (E, 1)
+        Returns None if stay has no valid nodes.
+
+    PyG DataLoader batches note_input_ids / note_attn_mask by concatenating along
+    dim-0 (default __cat_dim__), giving (N_note_total_batch, max_len). The
+    note_mask applied to batched node_type indexes the same rows in the same order.
+    """
+    events: list[dict] = []
+
+    for r in note_rows:
+        if "input_ids" not in r:
+            continue
+        events.append({
+            "type": 1,
+            "time": float(r["note_time"]),
+            "input_ids": r["input_ids"],    # Tensor(max_len,)
+            "attn_mask": r["attn_mask"],    # Tensor(max_len,)
+            "type_id": 0,                   # sentinel — not used for note nodes
+            "val": 0.0,
+        })
+
+    for r in signal_rows:
+        events.append({
+            "type": 0,
+            "time": float(r["event_hours_from_intime"]),
+            "input_ids": None,
+            "attn_mask": None,
+            "type_id": int(r["item_type_id"]),
+            "val": float(r["norm_value"]),
+        })
+
+    if not events:
+        return None
+
+    events.sort(key=lambda e: e["time"])
+    n = len(events)
+
+    node_type = torch.tensor([e["type"] for e in events], dtype=torch.long)
+    timestamps = torch.tensor([e["time"] / 24.0 for e in events], dtype=torch.float32)
+    item_type_ids = torch.tensor([e["type_id"] for e in events], dtype=torch.long)
+
+    # Signal feature: [norm_value, hours/24]; zeros for note nodes
+    x = torch.zeros(n, SIGNAL_VAL_DIM, dtype=torch.float32)
+    for i, e in enumerate(events):
+        if e["type"] == 0:
+            x[i, 0] = e["val"]
+            x[i, 1] = e["time"] / 24.0
+
+    # Note token tensors stacked into (N_note, max_len)
+    note_evts = [e for e in events if e["type"] == 1]
+    if note_evts:
+        note_input_ids = torch.stack([e["input_ids"] for e in note_evts])
+        note_attn_mask = torch.stack([e["attn_mask"] for e in note_evts])
+    else:
+        max_len = 256
+        note_input_ids = torch.zeros(0, max_len, dtype=torch.long)
+        note_attn_mask = torch.zeros(0, max_len, dtype=torch.long)
+
+    # Directed temporal edges: all (i → j) where time_i < time_j
+    if n > 1:
+        rows_t, cols_t = torch.triu_indices(n, n, offset=1)
+        edge_index = torch.stack([rows_t, cols_t])
+        dt = timestamps[cols_t] - timestamps[rows_t]
+        edge_attr = dt.unsqueeze(1)
+    else:
+        edge_index = torch.zeros(2, 0, dtype=torch.long)
+        edge_attr = torch.zeros(0, 1, dtype=torch.float32)
+
+    return Data(
+        x=x,
+        item_type_ids=item_type_ids,
+        note_input_ids=note_input_ids,
+        note_attn_mask=note_attn_mask,
+        node_type=node_type,
+        timestamps=timestamps,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+    )

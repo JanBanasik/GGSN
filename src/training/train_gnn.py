@@ -23,9 +23,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
-from src.models.tgnn_model import TemporalPatientGNN
+from src.models.tgnn_model import TemporalPatientGNN, TemporalPatientGNNE2E
 from src.utils import metrics as M
-from src.utils.graph_builder import build_patient_graph, load_note_embeddings
+from src.utils.graph_builder import (
+    build_patient_graph,
+    build_patient_graph_e2e,
+    load_note_embeddings,
+)
 
 
 # ── CSV pre-processing ─────────────────────────────────────────────────────
@@ -179,6 +183,133 @@ def build_datasets(
     return train_graphs, val_graphs, pos_weight
 
 
+# ── E2E dataset builder ────────────────────────────────────────────────────
+
+def build_datasets_e2e(
+    csv_path: Path,
+    tokenizer_name: str = "emilyalsentzer/Bio_ClinicalBERT",
+    max_len: int = 256,
+    train_ratio: float = 0.8,
+    seed: int = 42,
+    cache_path: Path | None = None,
+) -> tuple[list, list, float]:
+    """Build train/val graph lists with tokenised note text (for e2e fine-tuning).
+
+    Returns (train_graphs, val_graphs, pos_weight).
+    """
+    if cache_path is not None and cache_path.exists():
+        print(f"Loading cached e2e graphs from {cache_path}")
+        cached = torch.load(cache_path, weights_only=False)
+        return cached["train"], cached["val"], cached["pos_weight"]
+
+    from transformers import AutoTokenizer
+    print(f"Loading tokenizer {tokenizer_name}…")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    print("Pre-processing CSV…")
+    notes_by_stay, signals_by_stay, mortality_by_stay, subject_by_stay = (
+        _preprocess_csv(csv_path)
+    )
+
+    # Collect unique note texts from CSV
+    print("Collecting note texts…")
+    df = pl.read_csv(csv_path).with_columns(
+        (pl.col("event_hours_from_intime") + pl.col("delta_hours_to_note")).alias("note_hours")
+    )
+    note_text_df = (
+        df.group_by(["stay_id", "note_id"])
+        .agg(pl.first("text"), pl.first("note_hours"))
+    )
+    # Build {note_id -> text} and update notes_by_stay with note hours
+    note_texts: dict[str, str] = {}
+    for r in note_text_df.iter_rows(named=True):
+        note_texts[r["note_id"]] = r["text"] or ""
+
+    print(f"  {len(note_texts):,} unique notes — tokenising (max_len={max_len})…")
+    note_ids = list(note_texts.keys())
+    texts = [note_texts[nid] for nid in note_ids]
+
+    # Batch tokenise all notes at once
+    enc = tokenizer(
+        texts,
+        max_length=max_len,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids_all = enc["input_ids"]         # (N_notes, max_len) long
+    attn_mask_all = enc["attention_mask"]    # (N_notes, max_len) long
+
+    note_tokens: dict[str, tuple] = {
+        nid: (input_ids_all[i], attn_mask_all[i])
+        for i, nid in enumerate(note_ids)
+    }
+    print(f"  tokenisation done.")
+
+    # Enrich note_rows with token tensors
+    notes_with_tokens: dict[int, list] = defaultdict(list)
+    for stay_id, nrows in notes_by_stay.items():
+        for r in nrows:
+            nid = r["note_id"]
+            if nid not in note_tokens:
+                continue
+            ids, mask = note_tokens[nid]
+            notes_with_tokens[stay_id].append({
+                "note_id": nid,
+                "note_time": r["note_time"],
+                "input_ids": ids,
+                "attn_mask": mask,
+            })
+
+    # Train/val split
+    all_subjects = sorted(set(subject_by_stay.values()))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(all_subjects)
+    n_train = int(len(all_subjects) * train_ratio)
+    train_subj = set(all_subjects[:n_train])
+
+    train_stays = [s for s, subj in subject_by_stay.items() if subj in train_subj]
+    val_stays = [s for s, subj in subject_by_stay.items() if subj not in train_subj]
+    print(f"  split: {len(train_stays):,} train | {len(val_stays):,} val")
+
+    def _build_e2e(stay_ids):
+        graphs, skipped = [], 0
+        for sid in stay_ids:
+            data = build_patient_graph_e2e(
+                sid,
+                notes_with_tokens.get(sid, []),
+                signals_by_stay.get(sid, []),
+            )
+            if data is None:
+                skipped += 1
+                continue
+            data.y = torch.tensor(float(mortality_by_stay[sid]), dtype=torch.float32)
+            graphs.append(data)
+        if skipped:
+            print(f"  [builder] skipped {skipped} stays (no valid nodes)")
+        return graphs
+
+    print("Building train graphs…")
+    train_graphs = _build_e2e(train_stays)
+    print("Building val graphs…")
+    val_graphs = _build_e2e(val_stays)
+
+    n_pos = sum(int(g.y.item()) for g in train_graphs)
+    n_neg = len(train_graphs) - n_pos
+    pos_weight = n_neg / max(n_pos, 1)
+    print(f"  train: {n_pos:,} pos / {n_neg:,} neg  |  pos_weight = {pos_weight:.2f}")
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Caching to {cache_path}…")
+        torch.save(
+            {"train": train_graphs, "val": val_graphs, "pos_weight": pos_weight},
+            cache_path,
+        )
+
+    return train_graphs, val_graphs, pos_weight
+
+
 # ── Loss ───────────────────────────────────────────────────────────────────
 
 class FocalLoss(nn.Module):
@@ -208,8 +339,8 @@ class FocalLoss(nn.Module):
 # ── Evaluation ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, float]:
-    """Returns (val_loss, val_auroc). Uses unweighted BCE for val_loss."""
+def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, float, float]:
+    """Returns (val_loss, val_auroc, val_auprc). Uses unweighted BCE for val_loss."""
     model.eval()
     criterion = nn.BCEWithLogitsLoss()
     all_logits, all_labels = [], []
@@ -229,10 +360,11 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> tuple[float, flo
 
     try:
         val_auroc = M.auroc(labels_np, probs)
+        val_auprc = M.auprc(labels_np, probs)
     except ValueError:
-        val_auroc = 0.5  # fallback if only one class in batch
+        val_auroc = val_auprc = 0.5
 
-    return val_loss, val_auroc
+    return val_loss, val_auroc, val_auprc
 
 
 # ── Training ───────────────────────────────────────────────────────────────
@@ -246,15 +378,53 @@ def train(args: argparse.Namespace) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run: {run_id}")
 
-    cache = Path(args.cache_path) if args.cache_path else None
-    train_graphs, val_graphs, pos_weight = build_datasets(
-        Path(args.csv_path),
-        Path(args.embeddings_path),
-        train_ratio=args.train_ratio,
-        seed=args.seed,
-        cache_path=cache,
-    )
+    # ── Data & model ──────────────────────────────────────────────────────
+    if args.e2e:
+        e2e_cache = Path(args.cache_path).with_suffix("") .parent / "graphs_cache_e2e.pt"
+        train_graphs, val_graphs, pos_weight = build_datasets_e2e(
+            Path(args.csv_path),
+            tokenizer_name="emilyalsentzer/Bio_ClinicalBERT",
+            max_len=args.max_len,
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            cache_path=e2e_cache,
+        )
+        model = TemporalPatientGNNE2E(
+            text_tower_path=args.text_tower_path,
+            node_dim=64,
+            hidden_dim=args.hidden_dim,
+            n_layers=args.n_layers,
+            dropout=args.dropout,
+            pooling=args.pooling,
+            freeze_bert_layers=args.freeze_bert_layers,
+        ).to(device)
+        optimizer = torch.optim.Adam([
+            {"params": model.gnn_parameters(), "lr": args.lr, "weight_decay": 1e-4},
+            {"params": model.bert_parameters(), "lr": args.lr_bert, "weight_decay": 0.0},
+        ])
+    else:
+        cache = Path(args.cache_path) if args.cache_path else None
+        train_graphs, val_graphs, pos_weight = build_datasets(
+            Path(args.csv_path),
+            Path(args.embeddings_path),
+            train_ratio=args.train_ratio,
+            seed=args.seed,
+            cache_path=cache,
+        )
+        model = TemporalPatientGNN(
+            node_dim=64,
+            hidden_dim=args.hidden_dim,
+            n_layers=args.n_layers,
+            dropout=args.dropout,
+            pooling=args.pooling,
+        ).to(device)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=args.lr, weight_decay=1e-4
+        )
+
     print(f"Graphs: {len(train_graphs):,} train | {len(val_graphs):,} val")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model params: {n_params:,}")
 
     train_loader = DataLoader(
         train_graphs, batch_size=args.batch_size, shuffle=True, num_workers=0
@@ -263,22 +433,11 @@ def train(args: argparse.Namespace) -> None:
         val_graphs, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
 
-    model = TemporalPatientGNN(
-        node_dim=64,
-        hidden_dim=args.hidden_dim,
-        n_layers=args.n_layers,
-        dropout=args.dropout,
-        pooling=args.pooling,
-    ).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model params: {n_params:,}")
-
     pw_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
     criterion = FocalLoss(gamma=args.focal_gamma, pos_weight=pw_tensor)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-5
+        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-6
     )
 
     cfg = {**vars(args), "run_id": run_id, "pos_weight": round(pos_weight, 3)}
@@ -304,18 +463,19 @@ def train(args: argparse.Namespace) -> None:
             total_loss += loss.item()
 
         train_loss = total_loss / len(train_loader)
-        val_loss, val_auroc = evaluate(model, val_loader, device)
+        val_loss, val_auroc, val_auprc = evaluate(model, val_loader, device)
         scheduler.step(val_auroc)
-        lr_now = optimizer.param_groups[0]["lr"]
+        lr_now = optimizer.param_groups[0]["lr"]  # GNN LR
 
         print(
             f"Ep {epoch:3d} | train {train_loss:.4f} | val {val_loss:.4f} "
-            f"| AUROC {val_auroc:.4f} | lr {lr_now:.1e} | {time.time()-t0:.1f}s"
+            f"| AUROC {val_auroc:.4f} | AUPRC {val_auprc:.4f} "
+            f"| lr {lr_now:.1e} | {time.time()-t0:.1f}s"
         )
         log_rows.append({
             "epoch": epoch, "train_loss": round(train_loss, 4),
             "val_loss": round(val_loss, 4), "val_auroc": round(val_auroc, 4),
-            "lr": lr_now,
+            "val_auprc": round(val_auprc, 4), "lr": lr_now,
         })
 
         if val_auroc > best_auroc:
@@ -358,7 +518,9 @@ def train(args: argparse.Namespace) -> None:
     (run_dir / "final_metrics.json").write_text(json.dumps(final_metrics, indent=2))
 
     with open(run_dir / "train_log.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch","train_loss","val_loss","val_auroc","lr"])
+        writer = csv.DictWriter(
+            f, fieldnames=["epoch","train_loss","val_loss","val_auroc","val_auprc","lr"]
+        )
         writer.writeheader()
         writer.writerows(log_rows)
 
@@ -383,6 +545,16 @@ def main() -> None:
     p.add_argument("--pooling", default="mean", choices=["mean", "attention", "dual"])
     p.add_argument("--focal-gamma", type=float, default=0.0,
                    help="Focal loss gamma (0=plain BCE, 2=standard focal)")
+    # E2E fine-tuning
+    p.add_argument("--e2e", action="store_true",
+                   help="Fine-tune Phase 1 text_tower jointly with GNN")
+    p.add_argument("--text-tower-path", default="data/embeddings/text_tower.pt")
+    p.add_argument("--lr-bert", type=float, default=1e-5,
+                   help="LR for text_tower params (must be << --lr)")
+    p.add_argument("--freeze-bert-layers", type=int, default=8,
+                   help="Freeze bottom N BERT layers (0=all trainable, 12=fully frozen)")
+    p.add_argument("--max-len", type=int, default=256,
+                   help="Tokeniser max sequence length (e2e mode)")
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--train-ratio", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42)
