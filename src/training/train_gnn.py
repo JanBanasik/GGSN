@@ -20,6 +20,7 @@ import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from src.models.tgnn_model import TemporalPatientGNN
@@ -178,6 +179,32 @@ def build_datasets(
     return train_graphs, val_graphs, pos_weight
 
 
+# ── Loss ───────────────────────────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    """BCE with focal down-weighting of easy examples.
+
+    gamma=0 → plain BCE (with pos_weight).
+    gamma=2 → standard focal loss; hard positives dominate, easy negatives
+              contribute little → directly improves AUPRC on imbalanced data.
+    """
+
+    def __init__(self, gamma: float = 2.0, pos_weight: torch.Tensor | None = None):
+        super().__init__()
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=self.pos_weight, reduction="none"
+        )
+        if self.gamma == 0.0:
+            return bce.mean()
+        p = torch.sigmoid(logits)
+        p_t = p * targets + (1 - p) * (1 - targets)
+        return (((1 - p_t) ** self.gamma) * bce).mean()
+
+
 # ── Evaluation ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -247,7 +274,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"Model params: {n_params:,}")
 
     pw_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pw_tensor)
+    criterion = FocalLoss(gamma=args.focal_gamma, pos_weight=pw_tensor)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -353,7 +380,9 @@ def main() -> None:
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.3)
-    p.add_argument("--pooling", default="mean", choices=["mean", "attention"])
+    p.add_argument("--pooling", default="mean", choices=["mean", "attention", "dual"])
+    p.add_argument("--focal-gamma", type=float, default=0.0,
+                   help="Focal loss gamma (0=plain BCE, 2=standard focal)")
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--train-ratio", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42)

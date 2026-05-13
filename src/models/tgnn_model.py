@@ -7,6 +7,13 @@ Heterogeneous node types:
 
 Both types projected to NODE_DIM=64 via separate linear layers before GINEConv message
 passing. Edge attr is Δt/24 (scalar temporal distance).
+
+Pooling options:
+  "mean"      — global mean over all nodes
+  "attention" — learned gate weights nodes before pooling
+  "dual"      — separate mean pools for note and signal nodes, concatenated;
+                gives note semantics their own pathway instead of being diluted
+                by ~33 signal nodes in a ~35-node graph
 """
 from __future__ import annotations
 
@@ -26,9 +33,11 @@ class TemporalPatientGNN(nn.Module):
         hidden_dim: int = 128,
         n_layers: int = 3,
         dropout: float = 0.3,
-        pooling: str = "mean",          # "mean" | "attention"
+        pooling: str = "mean",          # "mean" | "attention" | "dual"
     ):
         super().__init__()
+
+        self.pooling = pooling
 
         # Separate projections for the two node types
         self.sig_proj = nn.Linear(SIGNAL_RAW_DIM, node_dim)   # 10 → 64
@@ -49,8 +58,6 @@ class TemporalPatientGNN(nn.Module):
 
         self.drop = nn.Dropout(dropout)
 
-        # Pooling: mean or learned attention gate
-        self.pooling = pooling
         if pooling == "attention":
             self.pool = AttentionalAggregation(
                 gate_nn=nn.Sequential(
@@ -59,9 +66,15 @@ class TemporalPatientGNN(nn.Module):
                     nn.Linear(hidden_dim // 2, 1),
                 )
             )
+            classifier_in = hidden_dim
+        elif pooling == "dual":
+            # Two mean pools → concat: note stream + signal stream
+            classifier_in = hidden_dim * 2
+        else:
+            classifier_in = hidden_dim
 
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
+            nn.Linear(classifier_in, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(32, 1),
@@ -87,9 +100,20 @@ class TemporalPatientGNN(nn.Module):
             h = F.relu(conv(h, edge_index, edge_attr))
             h = self.drop(h)
 
+        B = int(batch.max().item()) + 1
+
         if self.pooling == "attention":
             g = self.pool(h, batch)
-        else:
+
+        elif self.pooling == "dual":
+            # Pool note nodes and signal nodes separately, then concat.
+            # global_mean_pool with size=B returns zeros for graphs with no nodes
+            # of that type, so no special-casing needed.
+            note_g = global_mean_pool(h[note_mask], batch[note_mask], size=B)
+            sig_g = global_mean_pool(h[sig_mask], batch[sig_mask], size=B)
+            g = torch.cat([note_g, sig_g], dim=-1)   # (B, 2*hidden_dim)
+
+        else:  # mean
             g = global_mean_pool(h, batch)
 
         return self.classifier(g).squeeze(-1)  # (B,) logits
