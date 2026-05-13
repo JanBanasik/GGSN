@@ -156,6 +156,59 @@ To są embeddingi wejściowe do Fazy 2 GNN.
 
 ---
 
+## Faza 2 — GNN (2026-05-13) ✅
+
+**Setup**: TemporalPatientGNN (GINEConv×3, hidden 128, node_dim 64), v4 note-level
+embeddings (frozen), heterogeneous node projections (signal 10→64, note 128→64),
+all-pairs temporal edges z Δt/24 jako edge_attr, BCEWithLogitsLoss(pos_weight=6.9),
+Adam lr=1e-3, early stopping na val AUROC (patience=15). 52 727 stays, 80/20 split
+per subject_id.
+
+Run `20260513_111551`: early stopping ep.36, best val AUROC ep.21.
+
+| Metryka | Wartość |
+|---|---|
+| Val AUROC | **0.8156** |
+| Val AUPRC | 0.3787 (random baseline = 0.125) |
+| Brier score | 0.1822 |
+| Sensitivity@95%spec | 0.2982 |
+
+### Krzywa uczenia (kluczowe punkty)
+
+| Epoka | Val AUROC | Uwaga |
+|---|---|---|
+| 1 | 0.755 | **frozen Phase 1 embeddings startują tu — dowód że contrastive ma sens** |
+| 7 | 0.796 | GNN uczy się temporal structure |
+| 15 | 0.813 | plateau zaczyna się |
+| 21 | **0.816** | best |
+| 36 | — | early stop (patience=15 po ep.21) |
+
+### Porównanie z baseline
+
+| Model | AUROC | Delta |
+|---|---|---|
+| Phase 1 linear probe (logistic na note emb) | 0.730 | baseline |
+| **Phase 2 GNN (ten run)** | **0.816** | **+8.6 pp** |
+| Target | 0.88 | −6.4 pp do celu |
+
+**Kluczowa obserwacja**: epoka 1 = 0.755 to kurczę, a nie 0.5 — fakt że frozen embeddingi
+startują 25.5 pp powyżej losowego to bezpośredni dowód wartości Fazy 1. Dalsze +6.1 pp
+pochodzi z uczenia temporal structure w GNN.
+
+### Diagnoza plateau przy 0.816
+
+Val loss jest głośny (0.41–0.69 w trakcie plateau) — normalne przy różnych rozmiarach
+grafów (25–82 węzłów) i małym batch=32. AUROC stabilny → model nie jest overfit.
+
+Plateau wskazuje że obecna architektura jest zbliżona do swojego limitu przy frozen
+embeddings. Potencjalne dźwignie:
+- `hidden_dim` 128→256 (model może być wąskim gardłem)
+- Attention pooling zamiast mean pool (ważniejsze węzły powinny dominować)
+- Finetuning Phase 1 embeddings razem z GNN (end-to-end)
+- `n_layers` 3→4 (głębszy receptive field)
+
+---
+
 ## Tabela porównawcza wszystkich runów
 
 | Wersja | Run | Cohort | Strategia | Δt | Eff. batch | Best val | Baseline | % redukcji |
@@ -168,3 +221,9 @@ To są embeddingi wejściowe do Fazy 2 GNN.
 | v2 hard-neg #2 | 131540 | all-icus | note ±2h | ❌ | 64 | 3.135 | 4.16 | 24.6% (brak boost) |
 | v3 stay-level | 213819 | all-icus | stay_level | ✅ | 64 | 2.471 | 4.16 | 40.6% (zła granularność) |
 | **v4 note-level** ⭐ | **200632** | all-icus | **note ±2h** | ✅ | 64 | **2.980** | 4.16 | **28.3%** → Phase 2 |
+
+### Faza 2 GNN
+
+| Run | Embeddings | GNN layers | hidden | Pooling | Val AUROC |
+|---|---|---|---|---|---|
+| **20260513_111551** ⭐ | v4 frozen | GINEConv×3 | 128 | mean | **0.816** |
