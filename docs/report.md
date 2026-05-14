@@ -8,7 +8,7 @@ MIMIC-IV Clinical Database
 
 ## Abstract
 
-We propose a two-phase deep learning system for predicting in-hospital mortality from ICU data. Phase 1 trains a multimodal contrastive model aligning clinical notes with physiological signal measurements. Phase 2 constructs a heterogeneous temporal graph per ICU stay and trains a Graph Neural Network (GNN) classifier using the pre-trained note embeddings. On 52,727 ICU stays from MIMIC-IV, our best system achieves **AUROC 0.832**, **AUPRC 0.407**, and **Brier score 0.171** by augmenting the GNN with four demographic features (age, gender, admission urgency). The GNN without demographics achieves AUROC 0.816 / AUPRC 0.379, and a signal-only baseline (no Phase 1 embeddings, no demographics) achieves AUROC 0.73 — directly quantifying the contribution of each component. A key finding is that the Phase 1 embeddings alone achieve AUROC 0.755 on epoch 1 of GNN training before any task-specific learning.
+We propose a two-phase deep learning system for predicting in-hospital mortality from ICU data. Phase 1 trains a multimodal contrastive model aligning clinical notes with physiological signal measurements. Phase 2 constructs a heterogeneous temporal graph per ICU stay and trains a Graph Neural Network (GNN) classifier using the pre-trained note embeddings. On 52,727 ICU stays from MIMIC-IV, our best system achieves **AUROC 0.832**, **AUPRC 0.407**, and **Brier score 0.171** by augmenting the GNN with four demographic features (age, gender, admission urgency). The GNN without demographics achieves AUROC 0.816 / AUPRC 0.379, and a signal-only baseline (no Phase 1 embeddings, no demographics) achieves AUROC 0.748 — directly quantifying the contribution of each component. A key finding is that the Phase 1 embeddings alone achieve AUROC 0.755 on epoch 1 of GNN training before any task-specific learning.
 
 ---
 
@@ -163,13 +163,14 @@ Each component of the full pipeline is isolated by ablating one at a time.
 
 | Model | AUROC | AUPRC | Brier | Sens@95spec |
 |---|---|---|---|---|
-| Signal-only GNN (no NLP, no demo) | 0.73 | 0.21 | — | — |
+| Signal-only GNN (no NLP, no demo) | 0.748 | 0.295 | 0.272 | 0.219 |
+| Signal-only GNN + demographics | 0.789 | 0.346 | 0.210 | 0.271 |
 | Phase 1 + GNN — **baseline** | 0.816 | 0.379 | 0.182 | 0.298 |
 | Phase 1 + GNN + demographics | **0.832** | **0.407** | **0.171** | **0.334** |
 
 Demographics (4 features: age, gender, admission urgency) add **+1.6 pp AUROC** and **+2.8 pp AUPRC** over the GNN baseline. The Brier score improvement (0.182 → 0.171) reflects better calibration, and sensitivity at 95% specificity jumps from 0.298 → 0.334 — a clinically meaningful gain in high-specificity operating regimes.
 
-The signal-only GNN (AUROC 0.73) establishes how much temporal reasoning over physiological signals alone achieves. The gap to the Phase 1 baseline (+8.6 pp) quantifies the value of contrastive pre-training, and the demographics gap (+1.6 pp) shows that even four structured features provide signal the GNN cannot recover from trajectories alone.
+The signal-only GNN (AUROC 0.748) establishes how much temporal reasoning over physiological signals alone achieves. Adding demographics to the signal-only model raises it to 0.789 (+4.1 pp) — a larger boost than demographics give to the full model (+1.6 pp) — because demographics compensate partially for the absence of clinical note semantics. The remaining gap between signal+demo (0.789) and Phase 1+GNN (0.816) is +2.7 pp and is attributable entirely to the contrastive note embeddings.
 
 ### 5.2 Architecture Ablations (frozen embeddings, no demographics)
 
@@ -203,6 +204,8 @@ AUROC is consistently **below the frozen baseline (0.816)** and declining after 
 | Model | AUROC | Delta vs linear probe |
 |---|---|---|
 | Phase 1 linear probe (logistic on note embeddings) | 0.730 | — |
+| Signal-only GNN (no NLP, no demo) | 0.748 | +1.8 pp |
+| Signal-only GNN + demographics | 0.789 | +5.9 pp |
 | Phase 2 GNN with Phase 1 embeddings (frozen) | 0.816 | +8.6 pp |
 | Phase 2 GNN + demographics | **0.832** | **+10.2 pp** |
 | Phase 2 GNN with e2e fine-tuning | 0.764 | +3.4 pp (below frozen) |
@@ -229,7 +232,7 @@ We present a complete two-phase pipeline for ICU mortality prediction that:
 2. Constructs heterogeneous temporal graphs from ICU stays and trains a GNN classifier that achieves **AUROC 0.816** / **AUPRC 0.379** on 52,727 patients (frozen embeddings).
 3. Augments the GNN with 4 demographic features (age, gender, admission urgency) achieving **AUROC 0.832** / **AUPRC 0.407** / **Brier 0.171** — all four metrics improve simultaneously.
 4. Demonstrates through epoch-1 analysis that Phase 1 embeddings account for 0.755 of the final 0.832 AUROC before any task-specific learning.
-5. Identifies the remaining ceiling via signal-only ablation (AUROC 0.73): contrastive pre-training contributes +8.6 pp and demographics contribute a further +1.6 pp, with GNN architecture not being the bottleneck.
+5. Identifies the remaining ceiling via signal-only ablation (AUROC 0.748): contrastive pre-training contributes +6.8 pp and demographics contribute a further +1.6 pp, with GNN architecture not being the bottleneck.
 
 ### Future Work
 
