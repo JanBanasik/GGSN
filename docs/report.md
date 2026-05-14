@@ -217,7 +217,7 @@ AUROC is consistently **below the frozen baseline (0.816)** and declining after 
 
 **Why e2e fails:** Joint fine-tuning at any practical learning rate (10⁻⁵ or above) disrupts Phase 1 representations before the GNN can learn the mortality-specific structure. This is a fundamental tension in two-stage training: the upstream task (contrastive alignment) and downstream task (mortality classification) operate on different distributional objectives, and moving between them requires extremely conservative learning rates with full mixed-precision training infrastructure to be viable.
 
-**AUPRC vs AUROC:** The gap between AUROC (0.816) and AUPRC (0.379) reflects the class imbalance (12.5% positive rate). AUROC measures global ranking ability; AUPRC penalizes false positives at high recall. A random classifier achieves AUPRC = 0.125 (prevalence). Our model achieves 3.0× above chance, indicating meaningful precision-recall trade-off but with room for improvement in high-recall regimes.
+**AUPRC vs AUROC:** The gap between AUROC (0.832) and AUPRC (0.407) reflects the class imbalance (12.5% positive rate). AUROC measures global ranking ability; AUPRC penalizes false positives at high recall. A random classifier achieves AUPRC = 0.125 (prevalence). Our best model achieves 3.3× above chance. Demographics notably helped AUPRC more than AUROC (+2.8 pp vs +1.6 pp), likely because age and admission urgency provide a strong prior for calibrating confidence on high-risk patients.
 
 ---
 
@@ -234,9 +234,9 @@ We present a complete two-phase pipeline for ICU mortality prediction that:
 ### Future Work
 
 - **All-stay signal nodes**: extend signal graphs to include all chartevents from the full ICU stay (currently only ±2h paired events). Expected gain: +2–3 pp AUROC.
-- **Demographic features**: age, gender, admission type as graph-level features concatenated before the classifier. Low effort, +1–2 pp expected.
 - **E2E with sparse edges + AMP**: K=10 nearest-predecessor edges reduce O(n²) → O(n), enabling practical per-epoch times (~8 min) with mixed precision. lr\_bert=5×10⁻⁷ may avoid catastrophic forgetting. Potentially +3–5 pp if successful.
 - **ICD-10/care-unit-disjoint hard negatives**: the required fix for Phase 1 hard negative mining, enabling smarter contrastive learning.
+- **Richer demographics**: care unit one-hot, insurance, marital status — extending the 4-feature vector to ~12 features with minimal additional engineering.
 
 ---
 
