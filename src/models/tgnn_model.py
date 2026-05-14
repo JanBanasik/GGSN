@@ -24,7 +24,7 @@ from torch_geometric.nn import GINEConv, global_mean_pool
 from torch_geometric.nn.aggr import AttentionalAggregation
 
 from src.models.towers import EMBED_DIM, NUM_SIGNAL_TYPES, TYPE_EMBED_DIM, TextTower
-from src.utils.graph_builder import NODE_DIM, NOTE_EMB_DIM, SIGNAL_RAW_DIM, SIGNAL_VAL_DIM
+from src.utils.graph_builder import DEMO_DIM, NODE_DIM, NOTE_EMB_DIM, SIGNAL_RAW_DIM, SIGNAL_VAL_DIM
 
 
 class TemporalPatientGNN(nn.Module):
@@ -35,10 +35,12 @@ class TemporalPatientGNN(nn.Module):
         n_layers: int = 3,
         dropout: float = 0.3,
         pooling: str = "mean",          # "mean" | "attention" | "dual"
+        use_demo: bool = False,         # append DEMO_DIM demographic features after pooling
     ):
         super().__init__()
 
         self.pooling = pooling
+        self.use_demo = use_demo
 
         # Separate projections for the two node types
         self.sig_proj = nn.Linear(SIGNAL_RAW_DIM, node_dim)   # 10 → 64
@@ -69,10 +71,12 @@ class TemporalPatientGNN(nn.Module):
             )
             classifier_in = hidden_dim
         elif pooling == "dual":
-            # Two mean pools → concat: note stream + signal stream
             classifier_in = hidden_dim * 2
         else:
             classifier_in = hidden_dim
+
+        if use_demo:
+            classifier_in += DEMO_DIM  # append age_norm, gender_f, is_emergency, is_elective
 
         self.classifier = nn.Sequential(
             nn.Linear(classifier_in, 32),
@@ -105,17 +109,16 @@ class TemporalPatientGNN(nn.Module):
 
         if self.pooling == "attention":
             g = self.pool(h, batch)
-
         elif self.pooling == "dual":
-            # Pool note nodes and signal nodes separately, then concat.
-            # global_mean_pool with size=B returns zeros for graphs with no nodes
-            # of that type, so no special-casing needed.
             note_g = global_mean_pool(h[note_mask], batch[note_mask], size=B)
             sig_g = global_mean_pool(h[sig_mask], batch[sig_mask], size=B)
             g = torch.cat([note_g, sig_g], dim=-1)   # (B, 2*hidden_dim)
-
-        else:  # mean
+        else:
             g = global_mean_pool(h, batch)
+
+        if self.use_demo:
+            # data.demo is (B, DEMO_DIM) after PyG batching (stored as (1,DEMO_DIM) per graph)
+            g = torch.cat([g, data.demo], dim=-1)
 
         return self.classifier(g).squeeze(-1)  # (B,) logits
 

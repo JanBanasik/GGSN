@@ -94,6 +94,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Run: {run_id}")
 
     # ── Data ─────────────────────────────────────────────────────────────
+    demo_path = Path(args.demo_path) if args.demo_path else None
+
     if args.e2e:
         e2e_cache = Path(args.cache_path).parent / "graphs_cache_e2e.pt"
         train_graphs, val_graphs, pos_weight = build_datasets_e2e(
@@ -105,8 +107,10 @@ def train(args: argparse.Namespace) -> None:
             cache_path=e2e_cache,
         )
     else:
-        if args.signal_only:
-            cache = Path(args.cache_path).parent / "graphs_cache_signal_only.pt"
+        # Derive a cache name that encodes the ablation variant so configs don't collide
+        suffix = ("_signal_only" if args.signal_only else "") + ("_demo" if demo_path else "")
+        if suffix:
+            cache = Path(args.cache_path).parent / f"graphs_cache{suffix}.pt"
         else:
             cache = Path(args.cache_path) if args.cache_path else None
 
@@ -114,6 +118,7 @@ def train(args: argparse.Namespace) -> None:
             Path(args.csv_path),
             Path(args.embeddings_path),
             signal_only=args.signal_only,
+            demo_path=demo_path,
             train_ratio=args.train_ratio,
             seed=args.seed,
             cache_path=cache,
@@ -143,6 +148,7 @@ def train(args: argparse.Namespace) -> None:
             n_layers=args.n_layers,
             dropout=args.dropout,
             pooling=args.pooling,
+            use_demo=demo_path is not None,
         ).to(device)
         optimizer = torch.optim.Adam(
             model.parameters(), lr=args.lr, weight_decay=1e-4
@@ -248,6 +254,8 @@ def main() -> None:
     # Ablations
     p.add_argument("--signal-only", action="store_true",
                    help="Drop all note nodes — test signal-only temporal GNN")
+    p.add_argument("--demo-path", default=None,
+                   help="Path to demographics.csv (age_norm, gender_f, is_emergency, is_elective)")
     # Model
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--n-layers", type=int, default=3)

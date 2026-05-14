@@ -15,6 +15,7 @@ import polars as pl
 import torch
 
 from src.utils.graph_builder import (
+    DEMO_DIM,
     build_patient_graph,
     build_patient_graph_e2e,
     load_note_embeddings,
@@ -72,6 +73,22 @@ def _preprocess_csv(csv_path: Path) -> tuple[dict, dict, dict, dict]:
     return notes_by_stay, signals_by_stay, mortality_by_stay, subject_by_stay
 
 
+def _load_demo(demo_path: Path) -> dict[int, torch.Tensor]:
+    """Load demographics CSV → {stay_id -> Tensor(DEMO_DIM,)}."""
+    import polars as pl
+    df = pl.read_csv(demo_path)
+    demo: dict[int, torch.Tensor] = {}
+    for r in df.iter_rows(named=True):
+        feat = torch.tensor(
+            [r["age_norm"], float(r["gender_f"]),
+             float(r["is_emergency"]), float(r["is_elective"])],
+            dtype=torch.float32,
+        )
+        demo[int(r["stay_id"])] = feat
+    print(f"  {len(demo):,} stays with demographic features")
+    return demo
+
+
 def _build_graph_list(
     stay_ids: list[int],
     notes_by_stay: dict,
@@ -80,20 +97,27 @@ def _build_graph_list(
     note_embeddings: dict,
     *,
     signal_only: bool = False,
+    demo: dict[int, torch.Tensor] | None = None,
 ) -> list:
     """Build a PyG Data list for the given stays.
 
     signal_only=True drops all note nodes — useful for the signal-only ablation.
+    demo: if provided, attaches demographic features as data.demo (1, DEMO_DIM).
     """
     graphs, skipped = [], 0
+    _zero_demo = torch.zeros(DEMO_DIM) if demo is not None else None
+
     for sid in stay_ids:
         note_rows = [] if signal_only else notes_by_stay.get(sid, [])
         emb_dict = {} if signal_only else note_embeddings
+        demo_feat = demo.get(sid, _zero_demo) if demo is not None else None
+
         data = build_patient_graph(
             sid,
             note_rows,
             signals_by_stay.get(sid, []),
             emb_dict,
+            demo_feat=demo_feat,
         )
         if data is None:
             skipped += 1
@@ -125,6 +149,7 @@ def build_datasets(
     embeddings_path: Path,
     *,
     signal_only: bool = False,
+    demo_path: Path | None = None,
     train_ratio: float = 0.8,
     seed: int = 42,
     cache_path: Path | None = None,
@@ -132,6 +157,7 @@ def build_datasets(
     """Build subject-disjoint train/val graph lists (frozen embeddings mode).
 
     signal_only=True: build graphs with only signal nodes (no Phase 1 embeddings).
+    demo_path: if set, attach DEMO_DIM demographic features to each graph.
     Returns (train_graphs, val_graphs, pos_weight).
     """
     if cache_path is not None and cache_path.exists():
@@ -153,18 +179,23 @@ def build_datasets(
     else:
         print("  signal-only mode — skipping note embeddings")
 
+    demo: dict | None = None
+    if demo_path is not None:
+        print(f"Loading demographics from {demo_path}…")
+        demo = _load_demo(demo_path)
+
     train_stays, val_stays = _subject_split(subject_by_stay, train_ratio, seed)
     print(f"  split: {len(train_stays):,} train | {len(val_stays):,} val")
 
     print("Building train graphs…")
     train_graphs = _build_graph_list(
         train_stays, notes_by_stay, signals_by_stay, mortality_by_stay,
-        note_embeddings, signal_only=signal_only,
+        note_embeddings, signal_only=signal_only, demo=demo,
     )
     print("Building val graphs…")
     val_graphs = _build_graph_list(
         val_stays, notes_by_stay, signals_by_stay, mortality_by_stay,
-        note_embeddings, signal_only=signal_only,
+        note_embeddings, signal_only=signal_only, demo=demo,
     )
 
     n_pos = sum(int(g.y.item()) for g in train_graphs)

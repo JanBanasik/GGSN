@@ -21,6 +21,7 @@ NODE_DIM = 64          # projected node feature dim (shared for both node types)
 SIGNAL_RAW_DIM = 10    # type_emb(8) + norm_value(1) + hours(1)  [frozen-emb mode]
 SIGNAL_VAL_DIM = 2     # norm_value(1) + hours(1)                [e2e mode]
 NOTE_EMB_DIM = 128     # text_tower output dim
+DEMO_DIM = 4           # age_norm, gender_f, is_emergency, is_elective
 
 
 def build_patient_graph(
@@ -28,6 +29,7 @@ def build_patient_graph(
     note_rows: list[dict],
     signal_rows: list[dict],
     note_embeddings: dict[str, torch.Tensor],
+    demo_feat: torch.Tensor | None = None,
 ) -> Data | None:
     """
     Build a temporal graph for one ICU stay.
@@ -38,18 +40,17 @@ def build_patient_graph(
         signal_rows:     List of dicts with keys: norm_value, item_type_id,
                          event_hours_from_intime.
         note_embeddings: {note_id -> Tensor(128,)} from Phase 1 text_tower.
+        demo_feat:       Optional Tensor(DEMO_DIM,) of graph-level demographic features.
+                         Stored as shape (1, DEMO_DIM) so PyG batches it to (B, DEMO_DIM).
 
     Returns:
         PyG Data with:
-            x           (N, NOTE_EMB_DIM) for note nodes  OR
-                        (N, SIGNAL_RAW_DIM) for signal nodes
-                        → caller projects to NODE_DIM inside the GNN model
+            x           (N, NOTE_EMB_DIM) — note nodes full / signal nodes zero-padded
             node_type   (N,) int  0=signal  1=note
-            timestamps  (N,) float hours/24 — used for edge construction
+            timestamps  (N,) float hours/24
             edge_index  (2, E) directed temporal edges
             edge_attr   (E, 1) Δt / 24
-            y           scalar float  mortality label
-            stay_id     int
+            demo        (1, DEMO_DIM) if demo_feat provided, else absent
         Returns None if stay has no valid nodes.
     """
     events: list[dict] = []
@@ -113,13 +114,18 @@ def build_patient_graph(
         dt = timestamps[dst] - timestamps[src]   # already normalized /24
         edge_attr = dt.unsqueeze(1)
 
-    return Data(
+    kwargs: dict = dict(
         x=x,
         node_type=node_type,
         timestamps=timestamps,
         edge_index=edge_index,
         edge_attr=edge_attr,
     )
+    if demo_feat is not None:
+        # shape (1, DEMO_DIM) so PyG cat-batches it to (B, DEMO_DIM)
+        kwargs["demo"] = demo_feat.unsqueeze(0)
+
+    return Data(**kwargs)
 
 
 def load_note_embeddings(embeddings_path: Path) -> dict[str, torch.Tensor]:
