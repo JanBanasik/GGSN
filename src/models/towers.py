@@ -66,7 +66,7 @@ class TextTower(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls = out.last_hidden_state[:, 0, :]   # (B, 768)
+        cls = out.last_hidden_state[:, 0, :]  # (B, 768)
         projected = self.proj(cls)
         return F.normalize(projected, dim=-1)
 
@@ -135,7 +135,7 @@ class SignalTower(nn.Module):
         hours: torch.Tensor | None = None,
         delta_hours: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        type_emb = self.type_embed(item_ids)                      # (B, L, type_embed_dim)
+        type_emb = self.type_embed(item_ids)  # (B, L, type_embed_dim)
         chans = [type_emb, values.unsqueeze(-1)]
         if self.use_hours:
             if hours is None:
@@ -148,18 +148,18 @@ class SignalTower(nn.Module):
                 # Normalise to roughly [-1, +1]; clip extremes for stability.
                 delta_hours = (delta_hours / self.delta_norm_hours).clamp(-1.5, 1.5)
             chans.append(delta_hours.unsqueeze(-1))
-        x = torch.cat(chans, dim=-1)                               # (B, L, in_channels)
-        x = x.transpose(1, 2)                                      # (B, C, L)
-        h = self.encoder(x)                                        # (B, 128, L)
+        x = torch.cat(chans, dim=-1)  # (B, L, in_channels)
+        x = x.transpose(1, 2)  # (B, C, L)
+        h = self.encoder(x)  # (B, 128, L)
 
         if mask is not None:
             # Mask out padded positions before pooling
-            m = mask.unsqueeze(1)                                  # (B, 1, L)
+            m = mask.unsqueeze(1)  # (B, 1, L)
             h = h * m
-            denom = m.sum(dim=-1).clamp(min=1.0)                   # (B, 1)
-            pooled = h.sum(dim=-1) / denom                         # (B, 128)
+            denom = m.sum(dim=-1).clamp(min=1.0)  # (B, 1)
+            pooled = h.sum(dim=-1) / denom  # (B, 128)
         else:
-            pooled = h.mean(dim=-1)                                # (B, 128)
+            pooled = h.mean(dim=-1)  # (B, 128)
 
-        projected = self.proj(pooled)                              # (B, embed_dim)
+        projected = self.proj(pooled)  # (B, embed_dim)
         return F.normalize(projected, dim=-1)

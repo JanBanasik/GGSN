@@ -47,34 +47,34 @@ CARDIO_UNITS = [
 
 # Cohort presets: None means "no filter — use all ICU types".
 COHORT_PRESETS: dict[str, list[str] | None] = {
-    "cardio":   CARDIO_UNITS,
+    "cardio": CARDIO_UNITS,
     "all-icus": None,
 }
-DEFAULT_COHORT = "cardio"
+DEFAULT_COHORT = "all-icus"
 
 # ---------------------------------------------------------------------------
 # Signal catalog – 7 vitals + 7 labs, mapped to a contiguous item_type_id
 # ---------------------------------------------------------------------------
 # Vitals (icu/chartevents). Mean values where multiple variants exist.
 VITALS_CATALOG: dict[str, list[int]] = {
-    "HR":         [220045],            # Heart Rate
-    "BP_mean":    [220181, 220052],    # NIBP mean (preferred), Art mean (fallback)
-    "BP_sys":     [220179, 220050],
-    "BP_dia":     [220180, 220051],
-    "SpO2":       [220277],
-    "RR":         [220210],
-    "Temp_F":     [223761],
+    "HR": [220045],  # Heart Rate
+    "BP_mean": [220181, 220052],  # NIBP mean (preferred), Art mean (fallback)
+    "BP_sys": [220179, 220050],
+    "BP_dia": [220180, 220051],
+    "SpO2": [220277],
+    "RR": [220210],
+    "Temp_F": [223761],
 }
 
 # Labs (hosp/labevents). Use most common itemid for each label.
 LABS_CATALOG: dict[str, list[int]] = {
     "Troponin_I": [51002],
-    "NTproBNP":   [50963],
+    "NTproBNP": [50963],
     "Creatinine": [50912],
-    "Lactate":    [50813],
-    "Potassium":  [50971],
+    "Lactate": [50813],
+    "Potassium": [50971],
     "Hemoglobin": [51222],
-    "WBC":        [51301],
+    "WBC": [51301],
 }
 
 # Build signal_type → item_type_id mapping (vitals first, then labs)
@@ -93,20 +93,20 @@ ALL_LAB_ITEMIDS: list[int] = sorted({i for ids in LABS_CATALOG.values() for i in
 # Plausible physiological ranges for clipping (lo, hi) per signal name.
 # Used to compute normalized value ∈ [0, 1].
 NORM_RANGE: dict[str, tuple[float, float]] = {
-    "HR":         (30.0, 250.0),
-    "BP_mean":    (20.0, 200.0),
-    "BP_sys":     (40.0, 250.0),
-    "BP_dia":     (20.0, 150.0),
-    "SpO2":       (50.0, 100.0),
-    "RR":         (4.0, 60.0),
-    "Temp_F":     (90.0, 108.0),
+    "HR": (30.0, 250.0),
+    "BP_mean": (20.0, 200.0),
+    "BP_sys": (40.0, 250.0),
+    "BP_dia": (20.0, 150.0),
+    "SpO2": (50.0, 100.0),
+    "RR": (4.0, 60.0),
+    "Temp_F": (90.0, 108.0),
     "Troponin_I": (0.0, 50.0),
-    "NTproBNP":   (0.0, 35000.0),
+    "NTproBNP": (0.0, 35000.0),
     "Creatinine": (0.1, 15.0),
-    "Lactate":    (0.2, 20.0),
-    "Potassium":  (1.5, 8.0),
+    "Lactate": (0.2, 20.0),
+    "Potassium": (1.5, 8.0),
     "Hemoglobin": (4.0, 20.0),
-    "WBC":        (0.5, 100.0),
+    "WBC": (0.5, 100.0),
 }
 
 _DT_FMT = "%Y-%m-%d %H:%M:%S"
@@ -133,14 +133,10 @@ def load_cohort(cohort: str = DEFAULT_COHORT) -> pl.DataFrame:
     icustays_lf = pl.scan_csv(MIMIC_BASE / "icu" / "icustays.csv.gz")
     if units is not None:
         icustays_lf = icustays_lf.filter(pl.col("first_careunit").is_in(units))
-    icustays_lf = (
-        icustays_lf
-        .with_columns(
-            pl.col("intime").str.to_datetime(_DT_FMT, strict=False),
-            pl.col("outtime").str.to_datetime(_DT_FMT, strict=False),
-        )
-        .select(["subject_id", "hadm_id", "stay_id", "first_careunit", "intime", "outtime"])
-    )
+    icustays_lf = icustays_lf.with_columns(
+        pl.col("intime").str.to_datetime(_DT_FMT, strict=False),
+        pl.col("outtime").str.to_datetime(_DT_FMT, strict=False),
+    ).select(["subject_id", "hadm_id", "stay_id", "first_careunit", "intime", "outtime"])
 
     admissions_lf = (
         pl.scan_csv(MIMIC_BASE / "hosp" / "admissions.csv.gz")
@@ -153,14 +149,20 @@ def load_cohort(cohort: str = DEFAULT_COHORT) -> pl.DataFrame:
     )
 
     cohort_df = (
-        icustays_lf
-        .join(admissions_lf, on="hadm_id", how="left")
-        .with_columns(
-            pl.col("hospital_expire_flag").fill_null(0).alias("mortality")
-        )
+        icustays_lf.join(admissions_lf, on="hadm_id", how="left")
+        .with_columns(pl.col("hospital_expire_flag").fill_null(0).alias("mortality"))
         .select(
-            ["subject_id", "hadm_id", "stay_id", "first_careunit",
-             "intime", "outtime", "deathtime", "dischtime", "mortality"]
+            [
+                "subject_id",
+                "hadm_id",
+                "stay_id",
+                "first_careunit",
+                "intime",
+                "outtime",
+                "deathtime",
+                "dischtime",
+                "mortality",
+            ]
         )
         .collect()
     )
@@ -216,10 +218,12 @@ def load_vitals(cohort: pl.DataFrame) -> pl.DataFrame:
     Returns columns: stay_id, event_time, signal_name, valuenum
     """
     stay_window = cohort.select(["stay_id", "intime"]).lazy()
-    itemid_lookup = pl.LazyFrame({
-        "itemid": list(ITEMID_TO_SIGNAL.keys()),
-        "signal_name": list(ITEMID_TO_SIGNAL.values()),
-    })
+    itemid_lookup = pl.LazyFrame(
+        {
+            "itemid": list(ITEMID_TO_SIGNAL.keys()),
+            "signal_name": list(ITEMID_TO_SIGNAL.values()),
+        }
+    )
 
     vitals = (
         pl.scan_csv(MIMIC_BASE / "icu" / "chartevents.csv.gz")
@@ -262,10 +266,12 @@ def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
     Returns columns: stay_id, event_time, signal_name, valuenum
     """
     stay_window = cohort.select(["hadm_id", "stay_id", "intime"]).lazy()
-    itemid_lookup = pl.LazyFrame({
-        "itemid": list(ITEMID_TO_SIGNAL.keys()),
-        "signal_name": list(ITEMID_TO_SIGNAL.values()),
-    })
+    itemid_lookup = pl.LazyFrame(
+        {
+            "itemid": list(ITEMID_TO_SIGNAL.keys()),
+            "signal_name": list(ITEMID_TO_SIGNAL.values()),
+        }
+    )
 
     labs = (
         pl.scan_csv(MIMIC_BASE / "hosp" / "labevents.csv.gz")
@@ -288,10 +294,7 @@ def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
         .collect()
     )
 
-    print(
-        f"  Labs: {len(labs)} rows | "
-        f"signals: {sorted(labs['signal_name'].unique().to_list())}"
-    )
+    print(f"  Labs: {len(labs)} rows | signals: {sorted(labs['signal_name'].unique().to_list())}")
     return labs
 
 
@@ -305,18 +308,18 @@ PAIR_STRATEGY_STAY = "stay_level"
 def aggregate_notes_per_stay(notes: pl.DataFrame) -> pl.DataFrame:
     """
     Collapse radiology notes to one row per stay: texts concatenated in time order.
-    Synthetic ``note_id``: ``stay_<stay_id>`` for downstream CardiacPairsDataset.
+    Synthetic ``note_id``: ``stay_<stay_id>`` for downstream ContrastivePairsDataset.
     """
     out = (
         notes.sort("note_time")
         .group_by("stay_id", maintain_order=True)
-        .agg([
-            pl.col("text").implode().list.join("\n\n").alias("text"),
-            pl.col("note_time").min().alias("note_time"),
-        ])
-        .with_columns(
-            (pl.lit("stay_") + pl.col("stay_id").cast(pl.Utf8)).alias("note_id")
+        .agg(
+            [
+                pl.col("text").implode().list.join("\n\n").alias("text"),
+                pl.col("note_time").min().alias("note_time"),
+            ]
         )
+        .with_columns((pl.lit("stay_") + pl.col("stay_id").cast(pl.Utf8)).alias("note_id"))
     )
     return out.select(["note_id", "stay_id", "note_time", "text"])
 
@@ -344,18 +347,10 @@ def pair_notes_signals(
         print("  Pairing strategy: stay_level (full 24h vitals/labs vs concatenated notes)")
     elif pair_strategy == PAIR_STRATEGY_NOTE:
         window_sec = float(pair_window_hours) * 3600.0
-        paired = (
-            notes.join(signals, on="stay_id", how="inner")
-            .filter(
-                (pl.col("event_time") - pl.col("note_time"))
-                .dt.total_seconds()
-                .abs()
-                <= window_sec
-            )
+        paired = notes.join(signals, on="stay_id", how="inner").filter(
+            (pl.col("event_time") - pl.col("note_time")).dt.total_seconds().abs() <= window_sec
         )
-        print(
-            f"  Pairing strategy: note_level (±{pair_window_hours:g} h window)"
-        )
+        print(f"  Pairing strategy: note_level (±{pair_window_hours:g} h window)")
     else:
         raise ValueError(
             f"pair_strategy must be '{PAIR_STRATEGY_NOTE}' or '{PAIR_STRATEGY_STAY}', "
@@ -371,33 +366,31 @@ def pair_notes_signals(
     hi_expr = pl.col("signal_name").replace_strict(
         {k: v[1] for k, v in NORM_RANGE.items()}, return_dtype=pl.Float32
     )
-    type_id_expr = pl.col("signal_name").replace_strict(
-        SIGNAL_NAME_TO_ID, return_dtype=pl.Int32
-    )
+    type_id_expr = pl.col("signal_name").replace_strict(SIGNAL_NAME_TO_ID, return_dtype=pl.Int32)
 
     paired = paired.with_columns(
         ((pl.col("valuenum") - lo_expr) / (hi_expr - lo_expr))
-            .clip(norm_lo, norm_hi)
-            .alias("norm_value"),
+        .clip(norm_lo, norm_hi)
+        .alias("norm_value"),
         type_id_expr.alias("item_type_id"),
         # Hours from ICU admission (intime). Clipped to [0, 24] — the 24h
         # extraction window guarantees this range, but clip keeps it explicit
         # for downstream normalization.
-        ((pl.col("event_time") - pl.col("intime"))
-            .dt.total_seconds() / 3600.0)
-            .clip(pl.lit(0.0, dtype=pl.Float32), pl.lit(24.0, dtype=pl.Float32))
-            .cast(pl.Float32)
-            .alias("event_hours_from_intime"),
+        ((pl.col("event_time") - pl.col("intime")).dt.total_seconds() / 3600.0)
+        .clip(pl.lit(0.0, dtype=pl.Float32), pl.lit(24.0, dtype=pl.Float32))
+        .cast(pl.Float32)
+        .alias("event_hours_from_intime"),
         # Signed Δt between signal event and note (in hours). For note_level
         # pairing this is bounded by ±pair_window_hours; for stay_level the
         # synthetic note_time is the earliest real note in the stay so Δt is
         # in [0, 24h] but typically small for early notes and growing for late
         # signal events. Used by SignalTower as a 4th input channel.
-        ((pl.col("event_time") - pl.col("note_time"))
-            .dt.total_seconds() / 3600.0)
-            .cast(pl.Float32)
-            .alias("delta_hours_to_note"),
-    ).drop("intime")  # not needed in final CSV
+        ((pl.col("event_time") - pl.col("note_time")).dt.total_seconds() / 3600.0)
+        .cast(pl.Float32)
+        .alias("delta_hours_to_note"),
+    ).drop(
+        "intime"
+    )  # not needed in final CSV
 
     print(f"  Pairs: {len(paired)} (note × signal) rows")
     return paired
@@ -522,9 +515,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="MIMIC → pairs CSV (cohort + strategy aware)")
     parser.add_argument(
-        "--full",
+        "--toy",
         action="store_true",
-        help="Use full cohort (default: toy subset of 1000 stays)",
+        help="Trim cohort to first 1000 stays for fast iteration (default: full cohort)",
     )
     parser.add_argument(
         "--cohort",
@@ -552,7 +545,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     run_extraction(
-        toy=not args.full,
+        toy=args.toy,
         cohort=args.cohort,
         pair_strategy=args.pair_strategy,
         pair_window_hours=args.pair_window_hours,

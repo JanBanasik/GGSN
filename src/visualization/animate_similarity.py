@@ -30,14 +30,12 @@ from manim import (
     BLUE_E,
     DOWN,
     LEFT,
-    ORIGIN,
     RIGHT,
     UP,
     WHITE,
     YELLOW,
     Create,
     FadeIn,
-    FadeOut,
     Rectangle,
     Scene,
     Text,
@@ -87,9 +85,9 @@ class SimilarityEvolution(Scene):
     """Animuje N×N macierz cosine sim epoka-po-epoce."""
 
     # Config
-    CELL_SIZE = 0.20        # większe komórki = wyraźniejszy kontrast
-    GRID_MAX_N = 16         # mniej komórek = każda lepiej widoczna
-    HOLD_PER_EPOCH = 1.0    # wolniej = łatwiej zobaczyć zmiany
+    CELL_SIZE = 0.20  # większe komórki = wyraźniejszy kontrast
+    GRID_MAX_N = 16  # mniej komórek = każda lepiej widoczna
+    HOLD_PER_EPOCH = 1.0  # wolniej = łatwiej zobaczyć zmiany
     PER_EPOCH_NORMALIZE = True  # normalize colors per-frame (relative diagonal pop)
 
     def construct(self):
@@ -123,23 +121,27 @@ class SimilarityEvolution(Scene):
         accum = int(config.get("grad_accum_steps", 1))
         batch_str = (
             f"batch={config['batch_size']}×accum={accum}=eff {eff_b}"
-            if accum > 1 else f"batch={eff_b}"
+            if accum > 1
+            else f"batch={eff_b}"
         )
-        title = Text(
-            "Macierz podobieństw cos(text, signal)", font_size=32, weight="BOLD"
-        ).to_edge(UP, buff=0.4)
+        title = Text("Macierz podobieństw cos(text, signal)", font_size=32, weight="BOLD").to_edge(
+            UP, buff=0.4
+        )
         subtitle = Text(
             f"τ={config['temperature']} · {batch_str} · baseline ln({eff_b})={baseline_eff:.2f}",
             font_size=20,
         ).next_to(title, DOWN, buff=0.15)
 
         # === Etykieta epoki (zmieniana między klatkami) ===
-        epoch_label = Text(f"Epoka {epochs[0]:>3d} / {epochs[-1]}", font_size=28).to_edge(DOWN, buff=0.6)
+        epoch_label = Text(f"Epoka {epochs[0]:>3d} / {epochs[-1]}", font_size=28).to_edge(
+            DOWN, buff=0.6
+        )
 
         # === Diagonalna podpowiedź ===
         diag_hint = Text(
             "← przekątna = positive pairs (text_i ↔ signal_i)",
-            font_size=18, color=YELLOW,
+            font_size=18,
+            color=YELLOW,
         ).next_to(epoch_label, UP, buff=0.2)
 
         # === Grid komórek ===
@@ -176,14 +178,21 @@ class SimilarityEvolution(Scene):
         self.play(FadeIn(title), FadeIn(subtitle))
         self.play(
             Create(cell_group, run_time=1.2),
-            FadeIn(legend), FadeIn(x_axis_label), FadeIn(y_axis_label),
-            FadeIn(epoch_label), FadeIn(diag_hint),
+            FadeIn(legend),
+            FadeIn(x_axis_label),
+            FadeIn(y_axis_label),
+            FadeIn(epoch_label),
+            FadeIn(diag_hint),
         )
         self.wait(0.6)
 
         # Animacja po epokach
-        for ep_pos, (epoch_idx, mat) in enumerate(zip(epochs[1:], matrices[1:]), start=1):
-            new_label = Text(f"Epoka {epoch_idx:>3d} / {epochs[-1]}", font_size=28).move_to(epoch_label)
+        for ep_pos, (epoch_idx, mat) in enumerate(
+            zip(epochs[1:], matrices[1:], strict=False), start=1
+        ):
+            new_label = Text(f"Epoka {epoch_idx:>3d} / {epochs[-1]}", font_size=28).move_to(
+                epoch_label
+            )
 
             v_lo, v_hi = scales[ep_pos]
             anims = [epoch_label.animate.become(new_label)]
@@ -204,9 +213,9 @@ class SimilarityEvolution(Scene):
         for k in range(n_steps):
             v = vmax - (vmax - vmin) * (k / (n_steps - 1))
             color = value_to_color(v, vmin, vmax)
-            seg = Rectangle(
-                width=bar_w, height=bar_h / n_steps, stroke_width=0
-            ).set_fill(color, opacity=1.0)
+            seg = Rectangle(width=bar_w, height=bar_h / n_steps, stroke_width=0).set_fill(
+                color, opacity=1.0
+            )
             seg.shift(np.array([0.0, bar_h / 2 - k * bar_h / n_steps - bar_h / (2 * n_steps), 0.0]))
             steps.add(seg)
 

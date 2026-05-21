@@ -47,6 +47,8 @@ def filter_leakage_phrases(notes: pl.DataFrame, text_col: str = "text") -> pl.Da
     kept = notes.filter(~mask)
     dropped = len(notes) - len(kept)
     if dropped:
-        print(f"    [cleaner] dropped {dropped} notes matching leakage phrases "
-              f"({dropped / len(notes):.1%})")
+        print(
+            f"    [cleaner] dropped {dropped} notes matching leakage phrases "
+            f"({dropped / len(notes):.1%})"
+        )
     return kept

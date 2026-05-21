@@ -2,10 +2,10 @@
 Phase 1: Multimodal Contrastive Pre-training (Self-Supervised).
 
 Pipeline:
-  cardio_pairs.csv  →  CardiacPairsDataset  →  Two-Tower (BERT + CNN)
-                    →  InfoNCE loss  →  trained encoders
-                    →  per-epoch snapshots (embeddings + similarity matrix)
-                    →  final node_embeddings.pt for Phase 2 (GNN)
+  pairs_*.csv  →  ContrastivePairsDataset  →  Two-Tower (BERT + CNN)
+               →  InfoNCE loss  →  trained encoders
+               →  per-epoch snapshots (embeddings + similarity matrix)
+               →  final node_embeddings.pt for Phase 2 (GNN)
 
 Usage:
     uv run python -m src.training.train_contrastive
@@ -28,28 +28,28 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import polars as pl
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 
-from src.models.towers import (
-    BERT_MODEL,
-    EMBED_DIM,
-    NUM_SIGNAL_TYPES,
-    SignalTower,
-    TextTower,
-)
+from src.data_prep.contrastive_dataset import ContrastivePairsDataset, split_indices_by_subject
+from src.models.towers import BERT_MODEL, EMBED_DIM, NUM_SIGNAL_TYPES, SignalTower, TextTower
 from src.training.hard_negatives import (
     HardNegativeBatchSampler,
     compute_hard_negative_table,
     diagnose_hard_neg_table,
 )
+from src.training.loss import info_nce_loss
+from src.training.snapshot import (
+    compute_all_embeddings,
+    compute_text_signal_embeddings_arr,
+    evaluate_val_loss,
+    take_snapshot,
+)
 
 
 def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
-    """SHA-256 surowego pliku (np. cardio_pairs.csv) — ten sam plik = ten sam hash między osobami."""
     h = hashlib.sha256()
     with path.open("rb") as f:
         while b := f.read(chunk):
@@ -58,7 +58,6 @@ def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
 
 
 def _grad_scaler_cuda(enabled: bool):
-    """torch.amp.GradScaler exists from ~2.4; torch 2.2 ma tylko torch.cuda.amp.GradScaler."""
     amp_gs = getattr(torch.amp, "GradScaler", None)
     if amp_gs is not None:
         return amp_gs("cuda", enabled=enabled)
@@ -69,26 +68,31 @@ def _grad_scaler_cuda(enabled: bool):
 # Checkpoint helpers (resume training across sessions)
 # ---------------------------------------------------------------------------
 CHECKPOINT_NAME = "checkpoint.pt"
-# Hyperparams that, if changed at resume time, invalidate the optimizer/scheduler
-# state (different param shapes or different LR-schedule trajectory). Other fields
-# (epochs, max_time_hours, early_stop_patience) can change freely.
 CKPT_LOCKED_KEYS = (
-    "batch_size", "grad_accum_steps", "embed_dim", "freeze_bert",
-    "freeze_bottom_layers", "proj_dropout", "lr_bert", "lr_head",
-    "temperature", "seed", "val_frac",
-    "max_text_len", "seq_len",  # tensor shapes — must not change between sessions
+    "batch_size",
+    "grad_accum_steps",
+    "embed_dim",
+    "freeze_bert",
+    "freeze_bottom_layers",
+    "proj_dropout",
+    "lr_bert",
+    "lr_head",
+    "temperature",
+    "seed",
+    "val_frac",
+    "max_text_len",
+    "seq_len",
 )
 
 
 def save_checkpoint(path: Path, **state) -> None:
-    """Atomic-ish: write to .tmp then rename, so a Ctrl-C mid-write doesn't corrupt."""
+    """Atomic write: write to .tmp then rename, so Ctrl-C can't corrupt."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(state, tmp)
     tmp.replace(path)
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict:
-    """Load on CPU first then move per-tensor to avoid VRAM spike (see plan, edge cases)."""
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
@@ -110,13 +114,6 @@ def collect_rng_state() -> dict:
 
 
 def validate_resume_config(ckpt_config: dict, current_config: dict, force: bool) -> None:
-    """
-    At resume time: compare locked hyperparams. If any differ → raise unless --force.
-
-    Locked = anything that would invalidate optimizer/scheduler state (param shapes,
-    LR trajectory). Free to change between sessions: epochs, max_time_hours,
-    early_stop_patience, sim_matrix_n.
-    """
     diffs = {
         k: (ckpt_config.get(k), current_config.get(k))
         for k in CKPT_LOCKED_KEYS
@@ -135,39 +132,31 @@ def validate_resume_config(ckpt_config: dict, current_config: dict, force: bool)
 
 
 # ---------------------------------------------------------------------------
-# Hyper-parameters (overridable via CLI)
+# Hyper-parameter defaults
 # ---------------------------------------------------------------------------
 EPOCHS = 25
 BATCH_SIZE = 16
 MAX_TEXT_LEN = 256
-SEQ_LEN = 64                 # max signal events per note
-LR_BERT = 5e-6               # was 2e-5; lowered after observed overfit (epoch 2 was best)
+SEQ_LEN = 64
+LR_BERT = 5e-6
 LR_HEAD = 2e-4
 TEMPERATURE = 0.07
 GRAD_CLIP = 1.0
 WEIGHT_DECAY = 1e-4
 EARLY_STOP_PATIENCE = 5
-VAL_FRAC = 0.10              # 10% of subjects held out
+VAL_FRAC = 0.10
 SEED = 42
-SIM_MATRIX_N = 64            # NxN similarity snapshot for animation
-FREEZE_BOTTOM_LAYERS = 8     # 0=fine-tune all 12 BERT layers; 8=fine-tune only top 4
-PROJ_DROPOUT = 0.2           # dropout in TextTower projection head
-GRAD_ACCUM_STEPS = 4         # effective batch = batch_size * grad_accum_steps (align val InfoNCE to this N)
-FREEZE_BERT = False          # if True, freeze all 12 BERT layers (overrides FREEZE_BOTTOM_LAYERS)
-
-# Hard negative mining (off by default; activated by --hard-negatives)
-HARD_NEG_REFRESH_EVERY = 3   # rebuild hard-neg table every N epochs (1 = every epoch)
-HARD_NEG_POOL_SIZE = 256     # top-K cached hard negatives per anchor
-HARD_NEG_ANCHORS_PER_BATCH = 8  # M core anchors per batch (rest of batch = shared hard negs)
-
-# Val InfoNCE: "macro" = buffer micro-batches like train (same N as effective_batch when aligned);
-#            "full" = one InfoNCE over all val embeddings (max negative pool; needs VRAM for matmul).
+SIM_MATRIX_N = 64
+FREEZE_BOTTOM_LAYERS = 8
+PROJ_DROPOUT = 0.2
+GRAD_ACCUM_STEPS = 4
+FREEZE_BERT = False
+HARD_NEG_REFRESH_EVERY = 3
+HARD_NEG_POOL_SIZE = 256
+HARD_NEG_ANCHORS_PER_BATCH = 8
 VAL_LOSS_MODE = "macro"
 
 
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -179,383 +168,10 @@ def git_sha() -> str:
     try:
         repo_root = Path(__file__).resolve().parents[2]
         return subprocess.check_output(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            text=True,
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"], text=True
         ).strip()
     except Exception:
         return "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-class CardiacPairsDataset(Dataset):
-    """
-    Reads cardio_pairs.csv (one row per note × signal pair) and collapses to
-    one sample per unique note_id.
-
-    Each sample:
-        input_ids       (MAX_TEXT_LEN,) long
-        attention_mask  (MAX_TEXT_LEN,) long
-        item_ids        (SEQ_LEN,)      long  – signal type indices
-        values          (SEQ_LEN,)      float – normalised values in [0,1]
-        signal_mask     (SEQ_LEN,)      float – 1 for real event, 0 for pad
-        hours           (SEQ_LEN,)      float – event_hours_from_intime / 24 ∈ [0,1]
-                                                 (zeros when CSV doesn't have this column)
-        note_id         str
-        subject_id      int
-        mortality       int
-    """
-
-    def __init__(
-        self,
-        csv_path: Path,
-        tokenizer,
-        max_text_len: int = MAX_TEXT_LEN,
-        seq_len: int = SEQ_LEN,
-    ) -> None:
-        df = pl.read_csv(csv_path)
-        has_hours = "event_hours_from_intime" in df.columns
-        has_delta = "delta_hours_to_note" in df.columns
-
-        # Collect ordered events per note
-        per_note: dict[str, dict] = {}
-        for row in df.sort("event_time").iter_rows(named=True):
-            nid = row["note_id"]
-            entry = per_note.setdefault(nid, {
-                "text": row["text"],
-                "subject_id": int(row["subject_id"]),
-                "mortality": int(row["mortality"]),
-                "items": [],
-                "values": [],
-                "hours": [],
-                "deltas": [],
-            })
-            entry["items"].append(int(row["item_type_id"]))
-            entry["values"].append(float(row["norm_value"]))
-            if has_hours:
-                # Normalize to [0, 1] by /24 — extractor already clips to [0, 24]
-                entry["hours"].append(float(row["event_hours_from_intime"]) / 24.0)
-            else:
-                entry["hours"].append(0.0)
-            if has_delta:
-                # Raw hours, signed. SignalTower divides by delta_norm_hours (24).
-                entry["deltas"].append(float(row["delta_hours_to_note"]))
-            else:
-                entry["deltas"].append(0.0)
-
-        self.tokenizer = tokenizer
-        self.max_text_len = max_text_len
-        self.seq_len = seq_len
-        self.has_hours = has_hours
-        self.has_delta = has_delta
-
-        self.note_ids: list[str] = []
-        self.encodings: list[dict] = []
-        self.item_ids: list[torch.Tensor] = []
-        self.values: list[torch.Tensor] = []
-        self.hours: list[torch.Tensor] = []
-        self.deltas: list[torch.Tensor] = []
-        self.signal_masks: list[torch.Tensor] = []
-        self.subject_ids: list[int] = []
-        self.mortality: list[int] = []
-
-        print(f"  Tokenising {len(per_note)} unique notes… "
-              f"(hours: {has_hours}, delta: {has_delta})")
-        for nid, entry in per_note.items():
-            enc = tokenizer(
-                entry["text"],
-                max_length=max_text_len,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
-
-            items = entry["items"][:seq_len]
-            values = entry["values"][:seq_len]
-            hours_seq = entry["hours"][:seq_len]
-            deltas_seq = entry["deltas"][:seq_len]
-            real_n = len(items)
-            pad_n = seq_len - real_n
-            if pad_n > 0:
-                items = items + [0] * pad_n
-                values = values + [0.0] * pad_n
-                hours_seq = hours_seq + [0.0] * pad_n
-                deltas_seq = deltas_seq + [0.0] * pad_n
-
-            mask = [1.0] * real_n + [0.0] * pad_n
-
-            self.note_ids.append(nid)
-            self.encodings.append({
-                "input_ids": enc["input_ids"].squeeze(0),
-                "attention_mask": enc["attention_mask"].squeeze(0),
-            })
-            self.item_ids.append(torch.tensor(items, dtype=torch.long))
-            self.values.append(torch.tensor(values, dtype=torch.float32))
-            self.hours.append(torch.tensor(hours_seq, dtype=torch.float32))
-            self.deltas.append(torch.tensor(deltas_seq, dtype=torch.float32))
-            self.signal_masks.append(torch.tensor(mask, dtype=torch.float32))
-            self.subject_ids.append(entry["subject_id"])
-            self.mortality.append(entry["mortality"])
-
-    def __len__(self) -> int:
-        return len(self.note_ids)
-
-    def __getitem__(self, idx: int) -> dict:
-        return {
-            "input_ids": self.encodings[idx]["input_ids"],
-            "attention_mask": self.encodings[idx]["attention_mask"],
-            "item_ids": self.item_ids[idx],
-            "values": self.values[idx],
-            "hours": self.hours[idx],
-            "deltas": self.deltas[idx],
-            "signal_mask": self.signal_masks[idx],
-            "note_id": self.note_ids[idx],
-            "subject_id": self.subject_ids[idx],
-            "mortality": self.mortality[idx],
-        }
-
-
-def split_indices_by_subject(
-    dataset: CardiacPairsDataset, val_frac: float, seed: int
-) -> tuple[list[int], list[int]]:
-    """
-    Train/val split that keeps all notes from a subject in the SAME split
-    (prevents subject-level leakage during contrastive training).
-    """
-    rng = np.random.default_rng(seed)
-    subjects = sorted(set(dataset.subject_ids))
-    rng.shuffle(subjects)
-    n_val = max(1, int(len(subjects) * val_frac))
-    val_subjects = set(subjects[:n_val])
-
-    train_idx: list[int] = []
-    val_idx: list[int] = []
-    for i, sid in enumerate(dataset.subject_ids):
-        (val_idx if sid in val_subjects else train_idx).append(i)
-
-    return train_idx, val_idx
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-def info_nce_loss(z_text: torch.Tensor, z_signal: torch.Tensor, temperature: float) -> torch.Tensor:
-    """
-    Symmetric InfoNCE (NT-Xent) loss over in-batch positives.
-    z_text, z_signal are L2-normalised (N, D).
-    """
-    logits = torch.matmul(z_text, z_signal.T) / temperature  # (N, N)
-    labels = torch.arange(z_text.size(0), device=z_text.device)
-    loss_t2s = F.cross_entropy(logits, labels)
-    loss_s2t = F.cross_entropy(logits.T, labels)
-    return (loss_t2s + loss_s2t) / 2.0
-
-
-# ---------------------------------------------------------------------------
-# Snapshot helpers
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def compute_all_embeddings(
-    text_tower: TextTower,
-    dataset: CardiacPairsDataset,
-    indices: list[int],
-    batch_size: int,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Run text_tower over the given indices, return {note_id: tensor(D,)}."""
-    text_tower.eval()
-    out: dict[str, torch.Tensor] = {}
-    for start in range(0, len(indices), batch_size):
-        chunk = indices[start:start + batch_size]
-        items = [dataset[i] for i in chunk]
-        input_ids = torch.stack([it["input_ids"] for it in items]).to(device)
-        attention_mask = torch.stack([it["attention_mask"] for it in items]).to(device)
-        z = text_tower(input_ids, attention_mask).cpu()
-        for it, emb in zip(items, z):
-            out[it["note_id"]] = emb
-    return out
-
-
-@torch.no_grad()
-def compute_text_signal_embeddings_arr(
-    text_tower: TextTower,
-    signal_tower: SignalTower,
-    dataset: CardiacPairsDataset,
-    indices: list[int],
-    batch_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """
-    Compute (text_emb, signal_emb, subject_ids) as parallel tensors for the
-    given dataset indices. Used by hard negative mining (needs both modalities,
-    aligned, plus subject_id for leakage filter).
-    """
-    text_tower.eval()
-    signal_tower.eval()
-    text_chunks: list[torch.Tensor] = []
-    sig_chunks: list[torch.Tensor] = []
-    subject_ids: list[int] = []
-    for start in range(0, len(indices), batch_size):
-        chunk = indices[start:start + batch_size]
-        items = [dataset[i] for i in chunk]
-        input_ids = torch.stack([it["input_ids"] for it in items]).to(device)
-        attention_mask = torch.stack([it["attention_mask"] for it in items]).to(device)
-        item_ids = torch.stack([it["item_ids"] for it in items]).to(device)
-        values = torch.stack([it["values"] for it in items]).to(device)
-        signal_mask = torch.stack([it["signal_mask"] for it in items]).to(device)
-        hours = torch.stack([it["hours"] for it in items]).to(device)
-        deltas = torch.stack([it["deltas"] for it in items]).to(device)
-
-        text_chunks.append(text_tower(input_ids, attention_mask).cpu())
-        sig_chunks.append(signal_tower(item_ids, values, signal_mask, hours, deltas).cpu())
-        subject_ids.extend(it["subject_id"] for it in items)
-
-    return torch.cat(text_chunks, dim=0), torch.cat(sig_chunks, dim=0), subject_ids
-
-
-@torch.no_grad()
-def compute_similarity_matrix(
-    text_tower: TextTower,
-    signal_tower: SignalTower,
-    dataset: CardiacPairsDataset,
-    indices: list[int],
-    device: torch.device,
-) -> tuple[np.ndarray, list[str]]:
-    """
-    For a fixed list of `indices` (size N), compute NxN cos-sim matrix between
-    text and signal embeddings. Returns (matrix, note_ids).
-    """
-    text_tower.eval()
-    signal_tower.eval()
-    items = [dataset[i] for i in indices]
-    input_ids = torch.stack([it["input_ids"] for it in items]).to(device)
-    attention_mask = torch.stack([it["attention_mask"] for it in items]).to(device)
-    item_ids = torch.stack([it["item_ids"] for it in items]).to(device)
-    values = torch.stack([it["values"] for it in items]).to(device)
-    signal_mask = torch.stack([it["signal_mask"] for it in items]).to(device)
-    hours = torch.stack([it["hours"] for it in items]).to(device)
-    deltas = torch.stack([it["deltas"] for it in items]).to(device)
-
-    z_text = text_tower(input_ids, attention_mask)                       # (N, D)
-    z_sig = signal_tower(item_ids, values, signal_mask, hours, deltas)   # (N, D)
-    sim = (z_text @ z_sig.T).cpu().numpy()
-    note_ids = [it["note_id"] for it in items]
-    return sim, note_ids
-
-
-@torch.no_grad()
-def evaluate_val_loss(
-    text_tower: TextTower,
-    signal_tower: SignalTower,
-    val_loader: DataLoader,
-    temperature: float,
-    device: torch.device,
-    grad_accum_steps: int,
-    amp_enabled: bool,
-    val_loss_mode: str = VAL_LOSS_MODE,
-) -> tuple[float, dict[str, float | int]]:
-    """
-    Val InfoNCE aligned with training when val_loss_mode='macro': concatenate
-    micro-batches every grad_accum_steps (and remainder at end), same as train.
-
-    Returns (mean_loss, stats) where stats includes val_infonce_n_used for logging.
-    """
-    text_tower.eval()
-    signal_tower.eval()
-
-    if val_loss_mode == "full":
-        return _evaluate_val_loss_full_batch(
-            text_tower, signal_tower, val_loader, temperature, device, amp_enabled
-        )
-
-    if val_loss_mode != "macro":
-        raise ValueError(f"val_loss_mode must be 'macro' or 'full', got {val_loss_mode!r}")
-
-    losses: list[float] = []
-    chunk_sizes: list[int] = []
-    z_text_buf: list[torch.Tensor] = []
-    z_sig_buf: list[torch.Tensor] = []
-
-    def flush() -> None:
-        if not z_text_buf:
-            return
-        z_text_cat = torch.cat(z_text_buf, dim=0)
-        z_sig_cat = torch.cat(z_sig_buf, dim=0)
-        z_text_buf.clear()
-        z_sig_buf.clear()
-        if z_text_cat.size(0) < 2:
-            return
-        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-            loss = info_nce_loss(z_text_cat, z_sig_cat, temperature)
-        losses.append(loss.item())
-        chunk_sizes.append(int(z_text_cat.size(0)))
-
-    n_batches = len(val_loader)
-    for step, batch in enumerate(val_loader, 1):
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        item_ids = batch["item_ids"].to(device, non_blocking=True)
-        values = batch["values"].to(device, non_blocking=True)
-        signal_mask = batch["signal_mask"].to(device, non_blocking=True)
-        hours = batch["hours"].to(device, non_blocking=True)
-        deltas = batch["deltas"].to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-            z_text = text_tower(input_ids, attention_mask)
-            z_sig = signal_tower(item_ids, values, signal_mask, hours, deltas)
-        z_text_buf.append(z_text)
-        z_sig_buf.append(z_sig)
-        is_step = (step % grad_accum_steps == 0) or (step == n_batches)
-        if is_step:
-            flush()
-
-    if not losses:
-        stats = {"val_infonce_n_mean": 0, "val_infonce_macro_chunks": 0}
-        return float("nan"), stats
-
-    mean_loss = float(np.mean(losses))
-    stats = {
-        "val_infonce_n_mean": float(np.mean(chunk_sizes)),
-        "val_infonce_macro_chunks": len(losses),
-    }
-    return mean_loss, stats
-
-
-@torch.no_grad()
-def _evaluate_val_loss_full_batch(
-    text_tower: TextTower,
-    signal_tower: SignalTower,
-    val_loader: DataLoader,
-    temperature: float,
-    device: torch.device,
-    amp_enabled: bool,
-) -> tuple[float, dict[str, float | int]]:
-    """Single InfoNCE over all validation embeddings (largest possible negative set)."""
-    text_tower.eval()
-    signal_tower.eval()
-    z_text_chunks: list[torch.Tensor] = []
-    z_sig_chunks: list[torch.Tensor] = []
-    for batch in val_loader:
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        item_ids = batch["item_ids"].to(device, non_blocking=True)
-        values = batch["values"].to(device, non_blocking=True)
-        signal_mask = batch["signal_mask"].to(device, non_blocking=True)
-        hours = batch["hours"].to(device, non_blocking=True)
-        deltas = batch["deltas"].to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-            z_text_chunks.append(text_tower(input_ids, attention_mask))
-            z_sig_chunks.append(signal_tower(item_ids, values, signal_mask, hours, deltas))
-    if not z_text_chunks:
-        return float("nan"), {"val_infonce_n_used": 0}
-    z_text = torch.cat(z_text_chunks, dim=0)
-    z_sig = torch.cat(z_sig_chunks, dim=0)
-    n = int(z_text.size(0))
-    if n < 2:
-        return float("nan"), {"val_infonce_n_used": n}
-    with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-        loss = info_nce_loss(z_text, z_sig, temperature)
-    return loss.item(), {"val_infonce_n_used": n}
 
 
 # ---------------------------------------------------------------------------
@@ -596,23 +212,16 @@ def train(
     """
     Main training entry. Returns path to the run directory.
 
-    Args:
-        resume_from: path to existing run dir; loads checkpoint.pt and continues.
-            Run continues IN THE SAME directory (log.csv appended).
-        max_time_hours: stop cleanly after this many hours wall-clock; checkpoint
-            written before exit. Resume command printed for next session.
-        force: allow resume despite locked-hyperparam mismatch.
+    resume_from: path to an existing run dir; loads checkpoint.pt and continues.
+    max_time_hours: stop cleanly after N wall-clock hours; checkpoint written first.
     """
     set_seed(seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
     if device.type == "cuda":
         print(f"GPU    : {torch.cuda.get_device_name(0)}")
         print(f"VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    print(f"AMP    : {use_amp and device.type == 'cuda'}")
 
-    # Run directory: new run OR continuation of existing one
     is_resume = resume_from is not None
     if is_resume:
         run_dir = Path(resume_from).resolve()
@@ -628,26 +237,21 @@ def train(
 
     # --- Data ---
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
-    dataset = CardiacPairsDataset(csv_path, tokenizer, max_text_len=max_text_len, seq_len=seq_len)
+    dataset = ContrastivePairsDataset(
+        csv_path, tokenizer, max_text_len=max_text_len, seq_len=seq_len
+    )
     train_idx, val_idx = split_indices_by_subject(dataset, val_frac, seed)
     print(f"  Train notes: {len(train_idx)} | Val notes: {len(val_idx)}")
 
-    # Default training loader (random batches). When hard_negatives is on,
-    # this loader is REPLACED before each refresh interval with a hard-negative
-    # batch_sampler — see _build_hard_neg_loader below.
     train_loader = DataLoader(
         Subset(dataset, train_idx),
-        batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=(device.type == "cuda"),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
-
-    # Effective batch == InfoNCE pool size. When hard_negatives is on, each
-    # batch has 1 anchor + (effective_batch - 1) hard negatives, NOT 1 anchor
-    # per micro-batch — so we use the full effective_batch as the sampler's
-    # batch_size and set grad_accum_steps=1 for the hard-neg path.
     effective_batch = batch_size * grad_accum_steps
-    # drop_last=False: remainder is merged into last macro-batch (same as train's end-of-epoch flush)
     val_loader = DataLoader(
         Subset(dataset, val_idx),
         batch_size=batch_size,
@@ -656,8 +260,6 @@ def train(
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
-
-    # Fixed indices for similarity-matrix snapshots (NxN, sorted note_ids for stability)
     sim_pool = sorted(val_idx, key=lambda i: dataset.note_ids[i])
     sim_indices = sim_pool[:sim_matrix_n] if len(sim_pool) >= sim_matrix_n else sim_pool
     print(f"  Similarity-matrix snapshot N: {len(sim_indices)}")
@@ -673,24 +275,13 @@ def train(
 
     n_bert_total = sum(p.numel() for p in text_tower.bert.parameters())
     n_bert_train = sum(p.numel() for p in text_tower.bert.parameters() if p.requires_grad)
-    print(f"  BERT trainable: {n_bert_train / 1e6:.1f}M / {n_bert_total / 1e6:.1f}M params "
-          f"(freeze_bottom_layers={freeze_bottom_layers}, proj_dropout={proj_dropout})")
+    print(f"  BERT trainable: {n_bert_train / 1e6:.1f}M / {n_bert_total / 1e6:.1f}M params")
 
-    # --- Optionally initialize tower weights from a previous run's BEST checkpoint ---
-    # This is fine-tuning style: load proven model weights, but start with FRESH
-    # optimizer/scheduler/scaler/RNG. Use this when --resume from checkpoint.pt
-    # would inherit a degraded state (e.g. catastrophic forgetting from too-aggressive
-    # hard-neg fine-tune). Combined with a much lower LR, this re-tries fine-tune from
-    # the last known-good weights.
     if init_from_weights and not is_resume:
         init_dir = Path(init_from_weights).resolve()
-        text_path = init_dir / "best_text_tower.pt"
-        sig_path = init_dir / "best_signal_tower.pt"
+        text_path, sig_path = init_dir / "best_text_tower.pt", init_dir / "best_signal_tower.pt"
         if not text_path.exists() or not sig_path.exists():
-            raise FileNotFoundError(
-                f"--init-from-weights expects best_text_tower.pt and best_signal_tower.pt in {init_dir}"
-            )
-        print(f"  Loading initial tower weights from: {init_dir}")
+            raise FileNotFoundError(f"--init-from-weights expects best_*.pt in {init_dir}")
         text_tower.load_state_dict(torch.load(text_path, map_location=device, weights_only=False))
         signal_tower.load_state_dict(torch.load(sig_path, map_location=device, weights_only=False))
         print("  → towers initialized from BEST checkpoint; optimizer/scheduler are FRESH.")
@@ -707,11 +298,10 @@ def train(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs * max(1, len(train_loader))
     )
-
     amp_enabled = use_amp and device.type == "cuda"
     scaler = _grad_scaler_cuda(amp_enabled)
 
-    # --- Run config (saved upfront so a crashed run is still self-describing) ---
+    # --- Config ---
     config = {
         "run_id": run_id,
         "git_sha": git_sha(),
@@ -736,42 +326,38 @@ def train(
         "freeze_bert": freeze_bert,
         "proj_dropout": proj_dropout,
         "grad_accum_steps": grad_accum_steps,
-        "effective_batch": int(batch_size * grad_accum_steps),
+        "effective_batch": int(effective_batch),
         "bert_trainable_params": int(n_bert_train),
         "bert_total_params": int(n_bert_total),
-        "infonce_baseline_ln_train": float(np.log(batch_size * grad_accum_steps)),
+        "infonce_baseline_ln_train": float(np.log(effective_batch)),
         "val_loss_mode": val_loss_mode,
         "val_macro_accum_steps": grad_accum_steps,
-        "infonce_baseline_ln_val_macro_aligned": float(np.log(batch_size * grad_accum_steps)),
+        "infonce_baseline_ln_val_macro_aligned": float(np.log(effective_batch)),
         "training_preset": training_preset,
         "cli_argv": list(cli_argv) if cli_argv else [],
-        "cardio_pairs_sha256": _sha256_file(csv_path) if csv_path.is_file() else None,
+        "pairs_csv_sha256": _sha256_file(csv_path) if csv_path.is_file() else None,
         "hard_negatives": hard_negatives,
         "hard_neg_refresh_every": hard_neg_refresh_every,
         "hard_neg_pool_size": hard_neg_pool_size,
         "hard_neg_anchors_per_batch": hard_neg_anchors_per_batch,
         "init_from_weights": str(Path(init_from_weights).resolve()) if init_from_weights else None,
     }
-    # --- Resume vs new run: write/load config + checkpoint ---
+
     log_path = run_dir / "log.csv"
     start_epoch = 1
     best_val = float("inf")
     bad_epochs = 0
 
     if is_resume:
-        ckpt_path = run_dir / CHECKPOINT_NAME
-        print(f"Loading checkpoint: {ckpt_path}")
-        ckpt = load_checkpoint(ckpt_path, device)
-
-        # Validate that we're not changing locked hyperparams
+        ckpt = load_checkpoint(run_dir / CHECKPOINT_NAME, device)
         validate_resume_config(ckpt["config"], config, force=force)
-
-        # Update config in-place: keep checkpoint's locked fields, but allow
-        # epochs / max_time / patience to come from current CLI
-        config = {**ckpt["config"], "epochs": epochs, "training_preset": training_preset,
-                  "cli_argv": list(cli_argv) if cli_argv else ckpt["config"].get("cli_argv", [])}
+        config = {
+            **ckpt["config"],
+            "epochs": epochs,
+            "training_preset": training_preset,
+            "cli_argv": list(cli_argv) if cli_argv else ckpt["config"].get("cli_argv", []),
+        }
         (run_dir / "config.json").write_text(json.dumps(config, indent=2))
-
         text_tower.load_state_dict(ckpt["text_tower"])
         signal_tower.load_state_dict(ckpt["signal_tower"])
         text_tower.to(device)
@@ -780,54 +366,35 @@ def train(
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         restore_rng(ckpt)
-
         start_epoch = int(ckpt["epoch"]) + 1
         best_val = float(ckpt["best_val"])
         bad_epochs = int(ckpt["bad_epochs"])
-
         if start_epoch > epochs:
             raise RuntimeError(
                 f"Checkpoint already at epoch {ckpt['epoch']} >= target {epochs}. "
                 f"Increase --epochs or use a different run dir."
             )
-        print(f"  Resumed from epoch {ckpt['epoch']}; continuing {start_epoch}..{epochs} "
-              f"(best_val={best_val:.4f}, bad_epochs={bad_epochs})")
-
+        print(f"  Resumed from epoch {ckpt['epoch']}; continuing {start_epoch}..{epochs}")
         if cli_argv:
-            quoted = " ".join(shlex.quote(a) for a in cli_argv)
             with (run_dir / "RUN_COMMAND.txt").open("a") as f:
-                f.write(f"\n# Resume session: {quoted}\n")
+                f.write(f"\n# Resume: {' '.join(shlex.quote(a) for a in cli_argv)}\n")
     else:
         (run_dir / "config.json").write_text(json.dumps(config, indent=2))
         if cli_argv:
-            quoted = " ".join(shlex.quote(a) for a in cli_argv)
             (run_dir / "RUN_COMMAND.txt").write_text(
-                f"{quoted}\n\n"
-                "# Powiel na innej maszynie (ten sam repo, ten sam cardio_pairs.csv po sha256).\n"
+                f"{' '.join(shlex.quote(a) for a in cli_argv)}\n"
             )
-        log_path.write_text(
-            "epoch,train_loss,val_loss,val_infonce_n_mean,lr,elapsed_s\n"
-        )
-
-        # Snapshot epoch 0 (pre-training baseline) — only for fresh run
+        log_path.write_text("epoch,train_loss,val_loss,val_infonce_n_mean,lr,elapsed_s\n")
         print("\nSnapshot epoch 0 (pre-training)…")
-        _take_snapshot(
-            run_dir, 0, text_tower, signal_tower, dataset, val_idx, sim_indices,
-            batch_size, device,
+        take_snapshot(
+            run_dir, 0, text_tower, signal_tower, dataset, val_idx, sim_indices, batch_size, device
         )
 
-    # --- Hard negatives: state shared across epochs ---
+    # --- Hard negative state ---
     hard_neg_table: torch.Tensor | None = None
-    hard_neg_seed = seed * 1000 + 7  # different stream than dataloader shuffle
+    hard_neg_seed = seed * 1000 + 7
 
     def rebuild_hard_neg_loader() -> DataLoader:
-        """Construct a DataLoader whose batch_sampler yields hard-negative batches.
-
-        Each batch = M core anchors (subject-disjoint) + (effective_batch - M)
-        shared hard negatives (subject-disjoint vs anchors). All ``effective_batch``
-        items go through both towers and form a standard CLIP-style InfoNCE
-        with diagonal positives + in-batch negatives — but the negatives are HARD.
-        """
         gen = torch.Generator().manual_seed(hard_neg_seed + epoch)
         sampler = HardNegativeBatchSampler(
             hard_neg_table,
@@ -838,91 +405,66 @@ def train(
             generator=gen,
         )
         return DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=2, pin_memory=(device.type == "cuda"),
+            dataset, batch_sampler=sampler, num_workers=2, pin_memory=(device.type == "cuda")
         )
 
-    # --- Training ---
-    print(f"\nTraining epochs {start_epoch}..{epochs} | train={len(train_idx)} val={len(val_idx)} "
-          f"| batch={batch_size} × accum={grad_accum_steps} = effective {effective_batch} "
-          f"| InfoNCE baseline = ln({effective_batch}) = {np.log(effective_batch):.3f}\n"
-          f"| val_loss_mode={val_loss_mode} (macro aligns val InfoNCE batching with train)"
-          + (f"\n| hard_negatives=ON, refresh_every={hard_neg_refresh_every}, "
-             f"pool={hard_neg_pool_size} (warmup epoch 1 uses random)" if hard_negatives else "")
-          + "\n")
-
-    # Wall-clock budget for partial training across sessions
+    # --- Training loop ---
+    print(
+        f"\nTraining {start_epoch}..{epochs} | train={len(train_idx)} val={len(val_idx)} "
+        f"| batch={batch_size} × accum={grad_accum_steps} = effective {effective_batch} "
+        f"| InfoNCE baseline = ln({effective_batch}) = {np.log(effective_batch):.3f}\n"
+        f"| val_loss_mode={val_loss_mode}"
+        + (
+            f"\n| hard_negatives=ON, refresh_every={hard_neg_refresh_every}"
+            if hard_negatives
+            else ""
+        )
+        + "\n"
+    )
     session_start = time.time()
     max_seconds = float(max_time_hours) * 3600.0 if max_time_hours else float("inf")
     stopped_by_max_time = False
 
-    # When grad_accum > 1, we collect z_text/z_signal across micro-batches and
-    # compute InfoNCE on the concatenated tensor — that is what makes
-    # gradient accumulation a real "larger batch" for contrastive losses
-    # (naive accumulation of per-microbatch InfoNCE would NOT enlarge the
-    # negative pool, only smooth the gradient).
     for epoch in range(start_epoch, epochs + 1):
         text_tower.train()
         signal_tower.train()
 
-        # --- Hard negatives: refresh table + swap loader if needed ---
-        # Skip warmup epoch 1 (no embeddings to mine from); after that, rebuild
-        # every `hard_neg_refresh_every` epochs.
+        # Hard negatives: refresh table + swap loader
         epoch_grad_accum = grad_accum_steps
         if hard_negatives and epoch >= 2:
-            need_refresh = (
-                hard_neg_table is None
-                or ((epoch - 2) % hard_neg_refresh_every == 0)
-            )
+            need_refresh = hard_neg_table is None or ((epoch - 2) % hard_neg_refresh_every == 0)
             if need_refresh:
-                print(f"  [hard-neg] epoch {epoch}: rebuilding hard negative table over "
-                      f"{len(train_idx)} train samples…")
+                print(
+                    f"  [hard-neg] epoch {epoch}: rebuilding table over {len(train_idx)} train samples…"
+                )
                 t_hn = time.time()
                 text_emb, sig_emb, train_subj_ids = compute_text_signal_embeddings_arr(
-                    text_tower, signal_tower, dataset, train_idx, batch_size, device,
+                    text_tower,
+                    signal_tower,
+                    dataset,
+                    train_idx,
+                    batch_size,
+                    device,
                 )
-                hard_neg_table = compute_hard_negative_table(
-                    text_emb, sig_emb, train_subj_ids,
+                hard_neg_table_in_train = compute_hard_negative_table(
+                    text_emb,
+                    sig_emb,
+                    train_subj_ids,
                     k_per_anchor=hard_neg_pool_size,
                 )
-                # `compute_hard_negative_table` returns indices into the
-                # (text_emb, sig_emb) arrays — i.e. POSITIONS within `train_idx`.
-                # The sampler below feeds indices straight into `dataset`, so:
-                #   1) remap table values: pos_in_train → dataset_idx
-                #   2) expand table rows: pos_in_train → dataset_idx, padding
-                #      val rows with zeros (val anchors never get sampled here).
-                row_to_dataset = torch.as_tensor(train_idx, dtype=torch.long)
-                hard_neg_table_in_train = hard_neg_table  # (N_train, K) positions
-
-                # Verify no leakage BEFORE we remap (positions parallel to train_subj_ids)
                 stats = diagnose_hard_neg_table(
-                    hard_neg_table_in_train, train_subj_ids, sample_n=128,
+                    hard_neg_table_in_train, train_subj_ids, sample_n=128
                 )
                 if stats["same_subject_leakage"] != 0 or stats["self_refs"] != 0:
-                    raise RuntimeError(
-                        f"Hard negative table leakage check FAILED: {stats}. "
-                        f"This would teach the model to push apart same-patient notes."
-                    )
-
-                # Remap values to dataset indices
-                neg_dataset_idx = row_to_dataset[hard_neg_table_in_train]  # (N_train, K)
-
-                # Expand to (N_dataset, K) so sampler can index by dataset_idx directly.
-                # Val rows are filled with zeros (never sampled — sampler only iterates train_idx).
-                hard_neg_table = torch.zeros(
-                    (len(dataset), hard_neg_pool_size), dtype=torch.long,
-                )
+                    raise RuntimeError(f"Hard negative table leakage check FAILED: {stats}")
+                row_to_dataset = torch.as_tensor(train_idx, dtype=torch.long)
+                neg_dataset_idx = row_to_dataset[hard_neg_table_in_train]
+                hard_neg_table = torch.zeros((len(dataset), hard_neg_pool_size), dtype=torch.long)
                 hard_neg_table[row_to_dataset] = neg_dataset_idx
+                print(f"  [hard-neg] built in {time.time() - t_hn:.1f}s | leakage=0 ✓")
 
-                print(f"  [hard-neg] table built in {time.time() - t_hn:.1f}s | "
-                      f"shape={tuple(hard_neg_table.shape)} (expanded to N_dataset) | "
-                      f"leakage={stats['same_subject_leakage']}/{stats['sampled']} (must be 0) | "
-                      f"self_refs={stats['self_refs']} (must be 0)")
-
-            # Use hard-neg loader for this epoch; effective batch = sampler batch_size
             current_loader = rebuild_hard_neg_loader()
-            epoch_grad_accum = 1  # each batch IS the full effective batch
+            epoch_grad_accum = 1
         else:
             current_loader = train_loader
 
@@ -930,7 +472,6 @@ def train(
         n_optim_steps = 0
         t0 = time.time()
         optimizer.zero_grad(set_to_none=True)
-
         z_text_buf: list[torch.Tensor] = []
         z_sig_buf: list[torch.Tensor] = []
 
@@ -950,20 +491,18 @@ def train(
             z_text_buf.append(z_text)
             z_sig_buf.append(z_signal)
 
-            is_optim_step = (step % epoch_grad_accum == 0) or (step == len(current_loader))
-            if not is_optim_step:
+            if (step % epoch_grad_accum != 0) and (step != len(current_loader)):
                 continue
 
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-                z_text_cat = torch.cat(z_text_buf, dim=0)
-                z_sig_cat = torch.cat(z_sig_buf, dim=0)
-                loss = info_nce_loss(z_text_cat, z_sig_cat, temperature)
+                loss = info_nce_loss(
+                    torch.cat(z_text_buf, dim=0), torch.cat(z_sig_buf, dim=0), temperature
+                )
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                list(text_tower.parameters()) + list(signal_tower.parameters()),
-                GRAD_CLIP,
+            nn.utils.clip_grad_norm_(
+                list(text_tower.parameters()) + list(signal_tower.parameters()), GRAD_CLIP
             )
             scaler.step(optimizer)
             scaler.update()
@@ -976,8 +515,7 @@ def train(
             z_sig_buf.clear()
 
             if n_optim_steps % 25 == 0 or step == len(current_loader):
-                print(f"  Epoch {epoch}/{epochs} | optim_step {n_optim_steps:4d} "
-                      f"(micro {step}/{len(current_loader)}) | loss {loss.item():.4f}")
+                print(f"  Ep {epoch}/{epochs} | step {n_optim_steps:4d} | loss {loss.item():.4f}")
 
         train_loss = epoch_loss / max(1, n_optim_steps)
         val_loss, val_stats = evaluate_val_loss(
@@ -990,28 +528,32 @@ def train(
             amp_enabled=amp_enabled,
             val_loss_mode=val_loss_mode,
         )
-        if "val_infonce_n_used" in val_stats:
-            val_n = float(val_stats["val_infonce_n_used"])
-        else:
-            val_n = float(val_stats.get("val_infonce_n_mean", 0.0))
+        val_n = float(val_stats.get("val_infonce_n_used", val_stats.get("val_infonce_n_mean", 0.0)))
         elapsed = time.time() - t0
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f} "
-              f"| val_N≈{val_n:.1f} | lr {current_lr:.2e} | {elapsed:.1f}s\n")
+        print(
+            f"Epoch {epoch}/{epochs} | train {train_loss:.4f} | val {val_loss:.4f} "
+            f"| val_N≈{val_n:.1f} | lr {current_lr:.2e} | {elapsed:.1f}s\n"
+        )
 
         with log_path.open("a") as f:
             f.write(
-                f"{epoch},{train_loss:.6f},{val_loss:.6f},{float(val_n):.2f},"
+                f"{epoch},{train_loss:.6f},{val_loss:.6f},{val_n:.2f},"
                 f"{current_lr:.6e},{elapsed:.2f}\n"
             )
 
-        # Per-epoch snapshot
-        _take_snapshot(
-            run_dir, epoch, text_tower, signal_tower, dataset, val_idx, sim_indices,
-            batch_size, device,
+        take_snapshot(
+            run_dir,
+            epoch,
+            text_tower,
+            signal_tower,
+            dataset,
+            val_idx,
+            sim_indices,
+            batch_size,
+            device,
         )
 
-        # Early stopping (must update best_val/bad_epochs BEFORE saving checkpoint)
         if val_loss < best_val - 1e-4:
             best_val = val_loss
             bad_epochs = 0
@@ -1020,7 +562,6 @@ def train(
         else:
             bad_epochs += 1
 
-        # Save full resume-checkpoint (overwrites previous epoch's checkpoint)
         save_checkpoint(
             run_dir / CHECKPOINT_NAME,
             text_tower=text_tower.state_dict(),
@@ -1036,36 +577,32 @@ def train(
         )
 
         if bad_epochs >= early_stop_patience:
-            print(f"Early stopping at epoch {epoch} (no val improvement for {early_stop_patience} epochs).")
+            print(f"Early stopping at epoch {epoch}.")
             break
 
-        # Wall-clock budget check (graceful stop, checkpoint already saved)
         if time.time() - session_start >= max_seconds:
             stopped_by_max_time = True
             elapsed_h = (time.time() - session_start) / 3600.0
-            print(f"\n[max-time] Stopped after {elapsed_h:.2f}h (limit {max_time_hours}h).")
-            print(f"[max-time] Resume next session with:")
-            print(f"           uv run python -m src.training.train_contrastive "
-                  f"--resume {run_dir} --epochs {epochs}"
-                  + (f" --max-time-hours {max_time_hours}" if max_time_hours else ""))
+            print(f"\n[max-time] Stopped after {elapsed_h:.2f}h. Resume with:")
+            print(
+                f"  uv run python -m src.training.train_contrastive "
+                f"--resume {run_dir} --epochs {epochs}"
+                + (f" --max-time-hours {max_time_hours}" if max_time_hours else "")
+            )
             break
 
-    # --- Final artifacts (skip if stopped by --max-time-hours; resume + finish later) ---
     if stopped_by_max_time:
-        print(f"\n[max-time] Skipping final node_embeddings export (incomplete training).")
-        print(f"[max-time] Resume to finish — final artifacts will be exported then.")
+        print("[max-time] Resume to finish — final artifacts exported then.")
         return run_dir
 
     torch.save(text_tower.state_dict(), run_dir / "final_text_tower.pt")
     torch.save(signal_tower.state_dict(), run_dir / "final_signal_tower.pt")
 
-    # Export node embeddings for ALL notes (Phase 2 input)
     print("Exporting full node_embeddings.pt for all notes…")
     all_idx = list(range(len(dataset)))
     full_embeds = compute_all_embeddings(text_tower, dataset, all_idx, batch_size, device)
     torch.save(full_embeds, run_dir / "node_embeddings.pt")
 
-    # Also copy to canonical Phase-2 location
     canonical = csv_path.parent.parent / "embeddings"
     canonical.mkdir(parents=True, exist_ok=True)
     torch.save(full_embeds, canonical / "node_embeddings.pt")
@@ -1076,42 +613,10 @@ def train(
     return run_dir
 
 
-def _take_snapshot(
-    run_dir: Path,
-    epoch: int,
-    text_tower: TextTower,
-    signal_tower: SignalTower,
-    dataset: CardiacPairsDataset,
-    val_idx: list[int],
-    sim_indices: list[int],
-    batch_size: int,
-    device: torch.device,
-) -> None:
-    """Write per-epoch artifacts for animation: embeddings + similarity matrix."""
-    epoch_dir = run_dir / f"epoch_{epoch:03d}"
-    epoch_dir.mkdir(parents=True, exist_ok=True)
-
-    # Full validation embeddings (used by animate_umap.py)
-    val_embeds = compute_all_embeddings(text_tower, dataset, val_idx, batch_size, device)
-    torch.save(val_embeds, epoch_dir / "val_embeddings.pt")
-
-    # Validation labels (mortality) — needed for UMAP coloring
-    labels = {dataset.note_ids[i]: dataset.mortality[i] for i in val_idx}
-    (epoch_dir / "val_labels.json").write_text(json.dumps(labels))
-
-    # Fixed-N similarity matrix (used by animate_similarity.py)
-    sim, note_ids = compute_similarity_matrix(
-        text_tower, signal_tower, dataset, sim_indices, device
-    )
-    np.save(epoch_dir / "similarity_matrix.npy", sim)
-    (epoch_dir / "similarity_note_ids.json").write_text(json.dumps(note_ids))
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def apply_training_preset(ns: argparse.Namespace) -> None:
-    """Tune defaults for small radiology cohort vs full BERT (roadmap: freeze + accum)."""
     if ns.preset != "low-data-bert":
         return
     ns.freeze_bert = True
@@ -1133,100 +638,25 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=TEMPERATURE)
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--val-frac", type=float, default=VAL_FRAC)
-    p.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    p.add_argument("--no-amp", action="store_true")
     p.add_argument("--early-stop-patience", type=int, default=EARLY_STOP_PATIENCE)
-    p.add_argument("--freeze-bottom-layers", type=int, default=FREEZE_BOTTOM_LAYERS,
-                   help="Freeze first N of 12 BERT layers (default 8 = train top 4)")
-    p.add_argument("--freeze-bert", action="store_true",
-                   help="Freeze ALL BERT layers — train only proj head + signal tower")
+    p.add_argument("--freeze-bottom-layers", type=int, default=FREEZE_BOTTOM_LAYERS)
+    p.add_argument("--freeze-bert", action="store_true")
     p.add_argument("--proj-dropout", type=float, default=PROJ_DROPOUT)
-    p.add_argument("--grad-accum-steps", type=int, default=GRAD_ACCUM_STEPS,
-                   help="Gradient accumulation steps. Effective batch = batch_size × this. "
-                        "InfoNCE is computed on the concatenated effective batch.")
-    p.add_argument(
-        "--val-loss-mode",
-        type=str,
-        choices=("macro", "full"),
-        default=VAL_LOSS_MODE,
-        help="macro: buffer val batches like train (aligned N); "
-             "full: one InfoNCE over entire val set (max negatives; higher VRAM).",
-    )
-    p.add_argument(
-        "--preset",
-        type=str,
-        choices=("none", "low-data-bert"),
-        default="none",
-        help="low-data-bert: freeze BERT, lr_bert=0, lr_head=2e-4, accum=4 if defaults unchanged.",
-    )
-    p.add_argument(
-        "--csv-path",
-        type=str,
-        default=None,
-        help="Override input pairs CSV (default: data/processed/cardio_pairs.csv). "
-             "Use e.g. data/processed/pairs_all-icus_note_level.csv for full MIMIC.",
-    )
-    p.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Resume training from checkpoint.pt in this run dir (continues in same dir).",
-    )
-    p.add_argument(
-        "--max-time-hours",
-        type=float,
-        default=None,
-        help="Stop cleanly after this many wall-clock hours. Resume command printed.",
-    )
-    p.add_argument(
-        "--force",
-        action="store_true",
-        help="On --resume: allow continuing despite locked-hyperparam mismatch.",
-    )
-    p.add_argument(
-        "--hard-negatives",
-        action="store_true",
-        help="Mine hard negatives every N epochs (refresh table over train set).",
-    )
-    p.add_argument(
-        "--hard-neg-refresh-every",
-        type=int,
-        default=HARD_NEG_REFRESH_EVERY,
-        help="Rebuild hard negative table every N epochs (default 3).",
-    )
-    p.add_argument(
-        "--hard-neg-pool-size",
-        type=int,
-        default=HARD_NEG_POOL_SIZE,
-        help="Top-K cached hard negatives per anchor (default 256).",
-    )
-    p.add_argument(
-        "--hard-neg-anchors-per-batch",
-        type=int,
-        default=HARD_NEG_ANCHORS_PER_BATCH,
-        help="M core anchors per batch (default 8). batch_size - M = shared hard negs.",
-    )
-    p.add_argument(
-        "--init-from-weights",
-        type=str,
-        default=None,
-        help="Initialize towers from <run_dir>/best_text_tower.pt + best_signal_tower.pt. "
-             "Fresh optimizer/scheduler/RNG. Use for fine-tune from a known-good run "
-             "(e.g. low-LR hard-neg fine-tune after pretrain).",
-    )
-    p.add_argument(
-        "--max-text-len",
-        type=int,
-        default=MAX_TEXT_LEN,
-        help="BERT input max length (default 256). Use 512 for stay_level pairing "
-             "where notes are concatenated.",
-    )
-    p.add_argument(
-        "--seq-len",
-        type=int,
-        default=SEQ_LEN,
-        help="Max signal events per sample (default 64). Use 128-256 for stay_level "
-             "where one stay aggregates ~150-200 events.",
-    )
+    p.add_argument("--grad-accum-steps", type=int, default=GRAD_ACCUM_STEPS)
+    p.add_argument("--val-loss-mode", choices=("macro", "full"), default=VAL_LOSS_MODE)
+    p.add_argument("--preset", choices=("none", "low-data-bert"), default="none")
+    p.add_argument("--csv-path", type=str, default=None)
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--max-time-hours", type=float, default=None)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--hard-negatives", action="store_true")
+    p.add_argument("--hard-neg-refresh-every", type=int, default=HARD_NEG_REFRESH_EVERY)
+    p.add_argument("--hard-neg-pool-size", type=int, default=HARD_NEG_POOL_SIZE)
+    p.add_argument("--hard-neg-anchors-per-batch", type=int, default=HARD_NEG_ANCHORS_PER_BATCH)
+    p.add_argument("--init-from-weights", type=str, default=None)
+    p.add_argument("--max-text-len", type=int, default=MAX_TEXT_LEN)
+    p.add_argument("--seq-len", type=int, default=SEQ_LEN)
     return p.parse_args()
 
 
@@ -1235,13 +665,11 @@ if __name__ == "__main__":
     if args.preset == "low-data-bert":
         apply_training_preset(args)
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
     csv_path = (
         Path(args.csv_path).resolve()
         if args.csv_path
-        else PROJECT_ROOT / "data" / "processed" / "cardio_pairs.csv"
+        else PROJECT_ROOT / "data" / "processed" / "pairs_all-icus_note_level.csv"
     )
-
     train(
         csv_path=csv_path,
         snapshots_root=PROJECT_ROOT / "data" / "snapshots",

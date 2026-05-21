@@ -11,6 +11,7 @@ Features (DEMO_DIM = 4):
 Usage (from GGSN_Projektowe/):
     MIMIC_IV_ROOT=/path/to/mimiciv/3.1 uv run python -m src.data_prep.extract_demographics
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -36,42 +37,43 @@ def extract_demographics(out_path: Path | None = None) -> pl.DataFrame:
     out_path = out_path or (PROCESSED_DIR / "demographics.csv")
 
     print("Loading MIMIC tables…")
-    icustays = (
-        pl.scan_csv(MIMIC_BASE / "icu" / "icustays.csv.gz")
-        .select(["stay_id", "hadm_id", "subject_id"])
+    icustays = pl.scan_csv(MIMIC_BASE / "icu" / "icustays.csv.gz").select(
+        ["stay_id", "hadm_id", "subject_id"]
     )
-    admissions = (
-        pl.scan_csv(MIMIC_BASE / "hosp" / "admissions.csv.gz")
-        .select(["hadm_id", "admission_type"])
+    admissions = pl.scan_csv(MIMIC_BASE / "hosp" / "admissions.csv.gz").select(
+        ["hadm_id", "admission_type"]
     )
-    patients = (
-        pl.scan_csv(MIMIC_BASE / "hosp" / "patients.csv.gz")
-        .select(["subject_id", "anchor_age", "gender"])
+    patients = pl.scan_csv(MIMIC_BASE / "hosp" / "patients.csv.gz").select(
+        ["subject_id", "anchor_age", "gender"]
     )
 
     df = (
-        icustays
-        .join(admissions, on="hadm_id", how="left")
+        icustays.join(admissions, on="hadm_id", how="left")
         .join(patients, on="subject_id", how="left")
-        .with_columns([
-            # age normalised to [0, 1]; fill missing with 0.5
-            ((pl.col("anchor_age").cast(pl.Float32).clip(AGE_MIN, AGE_MAX) - AGE_MIN)
-             / (AGE_MAX - AGE_MIN))
-            .fill_null(0.5)
-            .alias("age_norm"),
-
-            # gender: F=1, M=0, unknown=0
-            (pl.col("gender") == "F").cast(pl.Int8).fill_null(0).alias("gender_f"),
-
-            # admission urgency flags
-            pl.col("admission_type")
-            .is_in(list(EMERGENCY_TYPES)).cast(pl.Int8).fill_null(0)
-            .alias("is_emergency"),
-
-            pl.col("admission_type")
-            .is_in(list(ELECTIVE_TYPES)).cast(pl.Int8).fill_null(0)
-            .alias("is_elective"),
-        ])
+        .with_columns(
+            [
+                # age normalised to [0, 1]; fill missing with 0.5
+                (
+                    (pl.col("anchor_age").cast(pl.Float32).clip(AGE_MIN, AGE_MAX) - AGE_MIN)
+                    / (AGE_MAX - AGE_MIN)
+                )
+                .fill_null(0.5)
+                .alias("age_norm"),
+                # gender: F=1, M=0, unknown=0
+                (pl.col("gender") == "F").cast(pl.Int8).fill_null(0).alias("gender_f"),
+                # admission urgency flags
+                pl.col("admission_type")
+                .is_in(list(EMERGENCY_TYPES))
+                .cast(pl.Int8)
+                .fill_null(0)
+                .alias("is_emergency"),
+                pl.col("admission_type")
+                .is_in(list(ELECTIVE_TYPES))
+                .cast(pl.Int8)
+                .fill_null(0)
+                .alias("is_elective"),
+            ]
+        )
         .select(["stay_id", "age_norm", "gender_f", "is_emergency", "is_elective"])
         .collect()
     )

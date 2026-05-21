@@ -33,24 +33,23 @@ from manim import (
     BLUE,
     DOWN,
     LEFT,
+    RED,
     RIGHT,
     UP,
     Dot,
     FadeIn,
-    RED,
     Scene,
     Text,
     Transform,
     VGroup,
-    WHITE,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SNAPSHOTS_DIR = PROJECT_ROOT / "data" / "snapshots"
 
-MAX_POINTS = 250          # ile punktów rysować (dla czytelności)
-PLOT_HALF_WIDTH = 4.5     # zasięg manim x ∈ [-W, +W]
-PLOT_HALF_HEIGHT = 3.0    # y ∈ [-H, +H]
+MAX_POINTS = 250  # ile punktów rysować (dla czytelności)
+PLOT_HALF_WIDTH = 4.5  # zasięg manim x ∈ [-W, +W]
+PLOT_HALF_HEIGHT = 3.0  # y ∈ [-H, +H]
 DOT_RADIUS = 0.05
 HOLD_PER_EPOCH = 0.65
 
@@ -79,7 +78,9 @@ def load_snapshots(run_dir: Path) -> tuple[list[int], list[np.ndarray], np.ndarr
 
     # Wspólny ordering: użyj note_id z epoki ostatniej, sortowane
     last = epoch_dirs[-1]
-    last_embeds: dict[str, torch.Tensor] = torch.load(last / "val_embeddings.pt", weights_only=False)
+    last_embeds: dict[str, torch.Tensor] = torch.load(
+        last / "val_embeddings.pt", weights_only=False
+    )
     note_ids = sorted(last_embeds.keys())
     if len(note_ids) > MAX_POINTS:
         rng = np.random.default_rng(42)
@@ -145,7 +146,7 @@ class UmapEvolution(Scene):
     def construct(self):
         run_dir = latest_run()
         config_path = run_dir / "config.json"
-        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        json.loads(config_path.read_text()) if config_path.exists() else {}
 
         epochs, embeds_per_epoch, labels, _ = load_snapshots(run_dir)
         if len(epochs) < 2:
@@ -158,14 +159,18 @@ class UmapEvolution(Scene):
         coords_2d = normalize_coords(coords_2d)
 
         # === Tytuł ===
-        title = Text("Embeddingi notatek w przestrzeni UMAP-2D", font_size=30, weight="BOLD").to_edge(UP, buff=0.3)
+        title = Text(
+            "Embeddingi notatek w przestrzeni UMAP-2D", font_size=30, weight="BOLD"
+        ).to_edge(UP, buff=0.3)
         sub = Text(
             f"Bio_ClinicalBERT + InfoNCE | val={len(labels)} notatek | "
             f"kolor: mortality (czerwony=zgon)",
             font_size=18,
         ).next_to(title, DOWN, buff=0.15)
 
-        epoch_label = Text(f"Epoka {epochs[0]:>3d} / {epochs[-1]}", font_size=24).to_edge(DOWN, buff=0.4)
+        epoch_label = Text(f"Epoka {epochs[0]:>3d} / {epochs[-1]}", font_size=24).to_edge(
+            DOWN, buff=0.4
+        )
 
         # === Punkty ===
         dots = VGroup()
@@ -189,7 +194,9 @@ class UmapEvolution(Scene):
 
         # Animacja epoka → epoka
         for ep_idx in range(1, len(epochs)):
-            new_label = Text(f"Epoka {epochs[ep_idx]:>3d} / {epochs[-1]}", font_size=24).move_to(epoch_label)
+            new_label = Text(f"Epoka {epochs[ep_idx]:>3d} / {epochs[-1]}", font_size=24).move_to(
+                epoch_label
+            )
             anims = [Transform(epoch_label, new_label)]
             target_xy = coords_2d[ep_idx]
             for k, d in enumerate(dots):

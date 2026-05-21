@@ -2,9 +2,17 @@
 Graph dataset construction for Phase 2 GNN training.
 
 Public API:
-    build_datasets(csv_path, embeddings_path, *, signal_only, ...) -> (train, val, pos_weight)
-    build_datasets_e2e(csv_path, ...) -> (train, val, pos_weight)
+    build_datasets(csv_path, embeddings_path, *, ...) -> (train, val, pos_weight)
+
+Optional features:
+    all_stay_signals_path  — full-stay signals from extract_all_stay_signals.py
+                             replaces the ±2h paired signals with the full stay trajectory
+    icd_path               — Charlson comorbidity CSV from extract_icd.py
+                             adds ICD node (node_type=2) to each graph
+
+End-to-end variant (build_datasets_e2e) has been moved to src/experimental/e2e.py.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -14,10 +22,11 @@ import numpy as np
 import polars as pl
 import torch
 
+from src.data_prep.extract_icd import CHARLSON_COLS
 from src.utils.graph_builder import (
     DEMO_DIM,
+    N_CHARLSON,
     build_patient_graph,
-    build_patient_graph_e2e,
     load_note_embeddings,
 )
 
@@ -36,33 +45,30 @@ def _preprocess_csv(csv_path: Path) -> tuple[dict, dict, dict, dict]:
         (pl.col("event_hours_from_intime") + pl.col("delta_hours_to_note")).alias("note_hours")
     )
 
-    notes_df = (
-        df.group_by(["stay_id", "note_id"])
-        .agg(pl.first("note_hours"))
-    )
-    signals_df = (
-        df.select(["stay_id", "event_hours_from_intime", "item_type_id", "norm_value"])
-        .unique(["stay_id", "event_hours_from_intime", "item_type_id"])
-    )
-    meta_df = (
-        df.group_by("stay_id")
-        .agg(pl.first("mortality"), pl.first("subject_id"))
-    )
+    notes_df = df.group_by(["stay_id", "note_id"]).agg(pl.first("note_hours"))
+    signals_df = df.select(
+        ["stay_id", "event_hours_from_intime", "item_type_id", "norm_value"]
+    ).unique(["stay_id", "event_hours_from_intime", "item_type_id"])
+    meta_df = df.group_by("stay_id").agg(pl.first("mortality"), pl.first("subject_id"))
 
     notes_by_stay: dict[int, list] = defaultdict(list)
     for r in notes_df.iter_rows(named=True):
-        notes_by_stay[r["stay_id"]].append({
-            "note_id": r["note_id"],
-            "note_time": float(r["note_hours"]),
-        })
+        notes_by_stay[r["stay_id"]].append(
+            {
+                "note_id": r["note_id"],
+                "note_time": float(r["note_hours"]),
+            }
+        )
 
     signals_by_stay: dict[int, list] = defaultdict(list)
     for r in signals_df.iter_rows(named=True):
-        signals_by_stay[r["stay_id"]].append({
-            "norm_value": float(r["norm_value"]),
-            "item_type_id": int(r["item_type_id"]),
-            "event_hours_from_intime": float(r["event_hours_from_intime"]),
-        })
+        signals_by_stay[r["stay_id"]].append(
+            {
+                "norm_value": float(r["norm_value"]),
+                "item_type_id": int(r["item_type_id"]),
+                "event_hours_from_intime": float(r["event_hours_from_intime"]),
+            }
+        )
 
     mortality_by_stay: dict[int, int] = {}
     subject_by_stay: dict[int, int] = {}
@@ -75,18 +81,56 @@ def _preprocess_csv(csv_path: Path) -> tuple[dict, dict, dict, dict]:
 
 def _load_demo(demo_path: Path) -> dict[int, torch.Tensor]:
     """Load demographics CSV → {stay_id -> Tensor(DEMO_DIM,)}."""
-    import polars as pl
     df = pl.read_csv(demo_path)
     demo: dict[int, torch.Tensor] = {}
     for r in df.iter_rows(named=True):
         feat = torch.tensor(
-            [r["age_norm"], float(r["gender_f"]),
-             float(r["is_emergency"]), float(r["is_elective"])],
+            [
+                r["age_norm"],
+                float(r["gender_f"]),
+                float(r["is_emergency"]),
+                float(r["is_elective"]),
+            ],
             dtype=torch.float32,
         )
         demo[int(r["stay_id"])] = feat
     print(f"  {len(demo):,} stays with demographic features")
     return demo
+
+
+def _load_icd(icd_path: Path) -> dict[int, torch.Tensor]:
+    """Load Charlson comorbidity CSV → {stay_id -> Tensor(N_CHARLSON,)}."""
+    df = pl.read_csv(icd_path)
+    icd: dict[int, torch.Tensor] = {}
+    for r in df.iter_rows(named=True):
+        feat = torch.tensor(
+            [float(r[c]) for c in CHARLSON_COLS],
+            dtype=torch.float32,
+        )
+        icd[int(r["stay_id"])] = feat
+    n_any = sum(1 for v in icd.values() if v.sum() > 0)
+    print(
+        f"  {len(icd):,} stays with ICD data | {n_any:,} ({n_any / max(len(icd), 1):.1%}) with ≥1 Charlson code"
+    )
+    return icd
+
+
+def _load_all_stay_signals(path: Path) -> dict[int, list[dict]]:
+    """Load full-stay signals CSV → {stay_id -> [{norm_value, item_type_id, event_hours_from_intime}]}."""
+    df = pl.read_csv(path)
+    signals: dict[int, list] = defaultdict(list)
+    for r in df.iter_rows(named=True):
+        signals[int(r["stay_id"])].append(
+            {
+                "norm_value": float(r["norm_value"]),
+                "item_type_id": int(r["item_type_id"]),
+                "event_hours_from_intime": float(r["event_hours_from_intime"]),
+            }
+        )
+    print(
+        f"  {sum(len(v) for v in signals.values()):,} signal events across {len(signals):,} stays"
+    )
+    return signals
 
 
 def _build_graph_list(
@@ -98,32 +142,47 @@ def _build_graph_list(
     *,
     signal_only: bool = False,
     demo: dict[int, torch.Tensor] | None = None,
+    icd: dict[int, torch.Tensor] | None = None,
+    all_stay_signals: dict[int, list] | None = None,
+    max_signals: int | None = None,
 ) -> list:
-    """Build a PyG Data list for the given stays.
-
-    signal_only=True drops all note nodes — useful for the signal-only ablation.
-    demo: if provided, attaches demographic features as data.demo (1, DEMO_DIM).
-    """
+    """Build a PyG Data list for the given stays."""
     graphs, skipped = [], 0
     _zero_demo = torch.zeros(DEMO_DIM) if demo is not None else None
+    _zero_icd = torch.zeros(N_CHARLSON) if icd is not None else None
 
     for sid in stay_ids:
         note_rows = [] if signal_only else notes_by_stay.get(sid, [])
         emb_dict = {} if signal_only else note_embeddings
         demo_feat = demo.get(sid, _zero_demo) if demo is not None else None
+        icd_feat = icd.get(sid, _zero_icd) if icd is not None else None
+
+        # Use full-stay signals if provided, otherwise fall back to paired signals
+        sig_rows = (
+            all_stay_signals.get(sid, [])
+            if all_stay_signals is not None
+            else signals_by_stay.get(sid, [])
+        )
+
+        # When using all-stay signals: keep only first max_signals events (earliest,
+        # not latest) so the model predicts from early-stay data, not terminal vitals.
+        if max_signals is not None and all_stay_signals is not None and len(sig_rows) > max_signals:
+            sig_rows = sorted(sig_rows, key=lambda r: r["event_hours_from_intime"])[:max_signals]
 
         data = build_patient_graph(
             sid,
             note_rows,
-            signals_by_stay.get(sid, []),
+            sig_rows,
             emb_dict,
             demo_feat=demo_feat,
+            icd_feat=icd_feat,
         )
         if data is None:
             skipped += 1
             continue
         data.y = torch.tensor(float(mortality_by_stay[sid]), dtype=torch.float32)
         graphs.append(data)
+
     if skipped:
         print(f"  [builder] skipped {skipped}/{len(stay_ids)} stays (no valid nodes)")
     return graphs
@@ -150,15 +209,26 @@ def build_datasets(
     *,
     signal_only: bool = False,
     demo_path: Path | None = None,
+    icd_path: Path | None = None,
+    all_stay_signals_path: Path | None = None,
+    max_signals: int | None = None,
     train_ratio: float = 0.8,
     seed: int = 42,
     cache_path: Path | None = None,
 ) -> tuple[list, list, float]:
     """Build subject-disjoint train/val graph lists (frozen embeddings mode).
 
-    signal_only=True: build graphs with only signal nodes (no Phase 1 embeddings).
-    demo_path: if set, attach DEMO_DIM demographic features to each graph.
+    Args:
+        signal_only:            Drop note nodes (signal-only ablation).
+        demo_path:              Demographics CSV → demographic features appended after pooling.
+        icd_path:               Charlson ICD CSV → ICD node (node_type=2) added per stay.
+        all_stay_signals_path:  Full-stay signals CSV → replaces paired signals.
+                                If None, uses ±2h paired signals from csv_path.
+
     Returns (train_graphs, val_graphs, pos_weight).
+
+    NOTE: Existing caches built with SIGNAL_RAW_DIM=10 are incompatible with
+    the current SIGNAL_RAW_DIM=16. Delete old .pt caches before first run.
     """
     if cache_path is not None and cache_path.exists():
         print(f"Loading cached graphs from {cache_path}")
@@ -166,9 +236,7 @@ def build_datasets(
         return cached["train"], cached["val"], cached["pos_weight"]
 
     print("Pre-processing CSV…")
-    notes_by_stay, signals_by_stay, mortality_by_stay, subject_by_stay = (
-        _preprocess_csv(csv_path)
-    )
+    notes_by_stay, signals_by_stay, mortality_by_stay, subject_by_stay = _preprocess_csv(csv_path)
     print(f"  {len(mortality_by_stay):,} stays | {len(notes_by_stay):,} with notes")
 
     note_embeddings: dict = {}
@@ -184,129 +252,47 @@ def build_datasets(
         print(f"Loading demographics from {demo_path}…")
         demo = _load_demo(demo_path)
 
+    icd: dict | None = None
+    if icd_path is not None:
+        print(f"Loading ICD comorbidities from {icd_path}…")
+        icd = _load_icd(icd_path)
+
+    all_stay_signals: dict | None = None
+    if all_stay_signals_path is not None:
+        print(f"Loading full-stay signals from {all_stay_signals_path}…")
+        all_stay_signals = _load_all_stay_signals(all_stay_signals_path)
+
     train_stays, val_stays = _subject_split(subject_by_stay, train_ratio, seed)
     print(f"  split: {len(train_stays):,} train | {len(val_stays):,} val")
 
+    if max_signals is not None and all_stay_signals_path is not None:
+        print(f"  capping signals to earliest {max_signals} per stay")
     print("Building train graphs…")
     train_graphs = _build_graph_list(
-        train_stays, notes_by_stay, signals_by_stay, mortality_by_stay,
-        note_embeddings, signal_only=signal_only, demo=demo,
+        train_stays,
+        notes_by_stay,
+        signals_by_stay,
+        mortality_by_stay,
+        note_embeddings,
+        signal_only=signal_only,
+        demo=demo,
+        icd=icd,
+        all_stay_signals=all_stay_signals,
+        max_signals=max_signals,
     )
     print("Building val graphs…")
     val_graphs = _build_graph_list(
-        val_stays, notes_by_stay, signals_by_stay, mortality_by_stay,
-        note_embeddings, signal_only=signal_only, demo=demo,
+        val_stays,
+        notes_by_stay,
+        signals_by_stay,
+        mortality_by_stay,
+        note_embeddings,
+        signal_only=signal_only,
+        demo=demo,
+        icd=icd,
+        all_stay_signals=all_stay_signals,
+        max_signals=max_signals,
     )
-
-    n_pos = sum(int(g.y.item()) for g in train_graphs)
-    n_neg = len(train_graphs) - n_pos
-    pos_weight = n_neg / max(n_pos, 1)
-    print(f"  train: {n_pos:,} pos / {n_neg:,} neg  |  pos_weight = {pos_weight:.3f}")
-
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Caching to {cache_path}…")
-        torch.save(
-            {"train": train_graphs, "val": val_graphs, "pos_weight": pos_weight},
-            cache_path,
-        )
-
-    return train_graphs, val_graphs, pos_weight
-
-
-def build_datasets_e2e(
-    csv_path: Path,
-    tokenizer_name: str = "emilyalsentzer/Bio_ClinicalBERT",
-    max_len: int = 256,
-    train_ratio: float = 0.8,
-    seed: int = 42,
-    cache_path: Path | None = None,
-) -> tuple[list, list, float]:
-    """Build train/val graph lists with tokenised note text (for e2e fine-tuning).
-
-    Returns (train_graphs, val_graphs, pos_weight).
-    """
-    if cache_path is not None and cache_path.exists():
-        print(f"Loading cached e2e graphs from {cache_path}")
-        cached = torch.load(cache_path, weights_only=False)
-        return cached["train"], cached["val"], cached["pos_weight"]
-
-    from transformers import AutoTokenizer
-
-    print(f"Loading tokenizer {tokenizer_name}…")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-
-    print("Pre-processing CSV…")
-    notes_by_stay, signals_by_stay, mortality_by_stay, subject_by_stay = (
-        _preprocess_csv(csv_path)
-    )
-
-    print("Collecting note texts…")
-    df = pl.read_csv(csv_path).with_columns(
-        (pl.col("event_hours_from_intime") + pl.col("delta_hours_to_note")).alias("note_hours")
-    )
-    note_text_df = (
-        df.group_by(["stay_id", "note_id"])
-        .agg(pl.first("text"), pl.first("note_hours"))
-    )
-    note_texts: dict[str, str] = {
-        r["note_id"]: r["text"] or ""
-        for r in note_text_df.iter_rows(named=True)
-    }
-
-    print(f"  {len(note_texts):,} unique notes — tokenising (max_len={max_len})…")
-    note_ids = list(note_texts.keys())
-    enc = tokenizer(
-        [note_texts[nid] for nid in note_ids],
-        max_length=max_len,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    )
-    note_tokens: dict[str, tuple] = {
-        nid: (enc["input_ids"][i], enc["attention_mask"][i])
-        for i, nid in enumerate(note_ids)
-    }
-    print("  tokenisation done.")
-
-    notes_with_tokens: dict[int, list] = defaultdict(list)
-    for stay_id, nrows in notes_by_stay.items():
-        for r in nrows:
-            nid = r["note_id"]
-            if nid not in note_tokens:
-                continue
-            ids, mask = note_tokens[nid]
-            notes_with_tokens[stay_id].append({
-                "note_id": nid,
-                "note_time": r["note_time"],
-                "input_ids": ids,
-                "attn_mask": mask,
-            })
-
-    train_stays, val_stays = _subject_split(subject_by_stay, train_ratio, seed)
-    print(f"  split: {len(train_stays):,} train | {len(val_stays):,} val")
-
-    def _build(stay_ids: list[int]) -> list:
-        graphs, skipped = [], 0
-        for sid in stay_ids:
-            data = build_patient_graph_e2e(
-                sid,
-                notes_with_tokens.get(sid, []),
-                signals_by_stay.get(sid, []),
-            )
-            if data is None:
-                skipped += 1
-                continue
-            data.y = torch.tensor(float(mortality_by_stay[sid]), dtype=torch.float32)
-            graphs.append(data)
-        if skipped:
-            print(f"  [builder] skipped {skipped} stays (no valid nodes)")
-        return graphs
-
-    print("Building train graphs…")
-    train_graphs = _build(train_stays)
-    print("Building val graphs…")
-    val_graphs = _build(val_stays)
 
     n_pos = sum(int(g.y.item()) for g in train_graphs)
     n_neg = len(train_graphs) - n_pos

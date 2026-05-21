@@ -1,4 +1,5 @@
 """Phase 2 evaluation metrics for mortality prediction."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -22,9 +23,7 @@ def brier_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(brier_score_loss(y_true, y_score))
 
 
-def sens_at_spec(
-    y_true: np.ndarray, y_score: np.ndarray, target_spec: float = 0.95
-) -> float:
+def sens_at_spec(y_true: np.ndarray, y_score: np.ndarray, target_spec: float = 0.95) -> float:
     """Sensitivity at a given specificity threshold."""
     fpr, tpr, _ = roc_curve(y_true, y_score)
     mask = fpr <= (1.0 - target_spec) + 1e-6

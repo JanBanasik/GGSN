@@ -27,7 +27,7 @@ API
 
 from __future__ import annotations
 
-from typing import Iterator, Sequence
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 import torch
@@ -78,14 +78,14 @@ def compute_hard_negative_table(
     # If the patient has more than N-k notes, top-k might fall short — pad below.
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        chunk_text = text_emb[start:end]                                 # (B, D)
-        scores = chunk_text @ signal_emb.T                               # (B, N)
+        chunk_text = text_emb[start:end]  # (B, D)
+        scores = chunk_text @ signal_emb.T  # (B, N)
 
         # Mask out invalid candidates (self + same subject) by setting -inf
-        chunk_sid = sid[start:end].unsqueeze(1)                          # (B, 1)
-        same_subject = (sid.unsqueeze(0) == chunk_sid)                   # (B, N)
+        chunk_sid = sid[start:end].unsqueeze(1)  # (B, 1)
+        same_subject = sid.unsqueeze(0) == chunk_sid  # (B, N)
         idx_self = torch.arange(start, end, device=device).unsqueeze(1)
-        is_self = (torch.arange(n, device=device).unsqueeze(0) == idx_self)
+        is_self = torch.arange(n, device=device).unsqueeze(0) == idx_self
         invalid = same_subject | is_self
         scores = scores.masked_fill(invalid, float("-inf"))
 
@@ -93,7 +93,7 @@ def compute_hard_negative_table(
         # If a row has < k_per_anchor valid (-inf) entries, topk still returns
         # k indices, but some scores will be -inf — pad those by repeating the
         # last valid index (best effort).
-        top_scores, top_idx = scores.topk(k_per_anchor, dim=1)           # (B, K)
+        top_scores, top_idx = scores.topk(k_per_anchor, dim=1)  # (B, K)
 
         # Find rows where any -inf appeared in top-k → fix by replacing -inf
         # entries with the last finite index in that row.
@@ -161,7 +161,9 @@ class HardNegativeBatchSampler:
         if hard_neg_table.dim() != 2:
             raise ValueError(f"hard_neg_table must be (N, K); got {tuple(hard_neg_table.shape)}")
         if anchors_per_batch < 1 or anchors_per_batch > batch_size:
-            raise ValueError(f"anchors_per_batch must be in [1, batch_size]; got {anchors_per_batch}")
+            raise ValueError(
+                f"anchors_per_batch must be in [1, batch_size]; got {anchors_per_batch}"
+            )
         self.hard_neg_table = hard_neg_table
         self.anchor_pool = list(anchor_pool)
         self.batch_size = int(batch_size)
@@ -233,7 +235,7 @@ class HardNegativeBatchSampler:
                 chosen_negs = [negs_list[i] for i in idx]
             else:
                 chosen_negs = list(negs_list)
-                fill_needed = n_extra - len(chosen_negs)
+                n_extra - len(chosen_negs)
                 avoid = anchor_set | negs_set
                 # walk a permutation of anchor_pool to fill the rest
                 fillers_pool = self._perm(len(self.anchor_pool))

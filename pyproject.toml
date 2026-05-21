@@ -1,7 +1,7 @@
 [project]
 name = "ggsn-projektowe"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Temporal GNN + Contrastive Learning for in-hospital mortality prediction on MIMIC-IV"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
     "torch>=2.2.2,<2.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "torch>=2.6,<2.7; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     # transformers 5.5+ wymaga torch≥2.4; na Intel mac mamy torch 2.2.x.
+    "lightning>=2.0",
     "torch-geometric>=2.7.0",
     "transformers>=4.46,<5; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "transformers>=5.5.4; sys_platform != 'darwin' or platform_machine != 'x86_64'",
@@ -32,3 +33,33 @@ viz = [
 # Reszta platform: torch 2.6 + numpy 1.x/2.x + transformers 5.x.
 # Animacje UMAP: `uv sync --extra viz`. Manim — osobno (numpy 2 vs Intel Mac).
 # GPU Linux: dodatkowo https://pytorch.org/get-started/locally/
+
+[dependency-groups]
+dev = [
+    "ruff>=0.7",
+    "black>=24",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["notebooks", "media"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length handled by formatter
+    "E741",   # ambiguous variable name (we use `n` for batch count etc.)
+    "B008",   # function call in argument default (torch defaults are fine)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/experimental/**" = ["F401", "E402"]  # negative-result code; imports after side-effect setup
+"src/visualization/**" = ["E402"]         # manim scripts often configure first
+"src/training/train_gnn.py" = ["E402"]    # imports after torch.set_float32_matmul_precision
+"src/training/train_contrastive.py" = ["E402"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+extend-exclude = "/(notebooks|media)/"

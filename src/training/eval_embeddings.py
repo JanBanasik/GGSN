@@ -12,9 +12,9 @@ Also plots the val-loss learning curve with reference baselines.
 Usage:
     uv run python -m src.training.eval_embeddings
     uv run python -m src.training.eval_embeddings \\
-        --run-dir data/snapshots/run_20260505_213819 \\
-        --epoch-a 0 --epoch-b 20 \\
-        --out data/plots/embedding_comparison.png
+        --run-dir data/snapshots/run_20260512_200632 \\
+        --epoch-a 0 --epoch-b 16 \\
+        --out data/plots/embedding_comparison_v4.png
 """
 
 from __future__ import annotations
@@ -34,14 +34,6 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-
-# ---------------------------------------------------------------------------
-# Historical reference points from docs/v2_results.md
-# ---------------------------------------------------------------------------
-HISTORY = {
-    "v1 note-level\n(cardio, ep.best)": {"infonce_val": 2.493, "auroc": 0.61, "purity": 0.51},
-    "v2 note-level\n(all-icus, ep.11)": {"infonce_val": 3.054, "auroc": None, "purity": None},
-}
 BASELINE_LN64 = 4.1589  # ln(64) — effective batch 64
 
 
@@ -51,9 +43,7 @@ BASELINE_LN64 = 4.1589  # ln(64) — effective batch 64
 def load_val_epoch(run_dir: Path, epoch: int) -> tuple[np.ndarray, np.ndarray]:
     """Load (X, y) for val set from a per-epoch snapshot."""
     folder = run_dir / f"epoch_{epoch:03d}"
-    emb: dict[str, torch.Tensor] = torch.load(
-        folder / "val_embeddings.pt", map_location="cpu"
-    )
+    emb: dict[str, torch.Tensor] = torch.load(folder / "val_embeddings.pt", map_location="cpu")
     labels: dict[str, int] = json.loads((folder / "val_labels.json").read_text())
 
     stay_ids = sorted(emb.keys())
@@ -64,10 +54,12 @@ def load_val_epoch(run_dir: Path, epoch: int) -> tuple[np.ndarray, np.ndarray]:
 
 def linear_probe_auroc(X: np.ndarray, y: np.ndarray, cv: int = 5) -> float:
     """5-fold stratified CV AUROC on the provided set (standard embedding eval protocol)."""
-    pipe = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=500, C=1.0, solver="lbfgs", random_state=42)),
-    ])
+    pipe = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=500, C=1.0, solver="lbfgs", random_state=42)),
+        ]
+    )
     skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
     aurocs = []
     for tr_idx, te_idx in skf.split(X, y):
@@ -104,6 +96,7 @@ def diagonal_gap(X: np.ndarray) -> float:
 
 def umap_2d(X: np.ndarray, y: np.ndarray, n_sample: int = 3000) -> tuple[np.ndarray, np.ndarray]:
     import umap as umap_lib  # lazy import so the script loads fast without umap
+
     rng = np.random.default_rng(42)
     if len(X) > n_sample:
         idx = rng.choice(len(X), n_sample, replace=False)
@@ -129,7 +122,9 @@ def plot_comparison(
     log = pd.read_csv(log_csv) if log_csv.exists() else None
 
     fig = plt.figure(figsize=(16, 10), facecolor="white")
-    fig.suptitle("Phase 1 — Contrastive Pre-training: Embedding Quality", fontsize=14, fontweight="bold")
+    fig.suptitle(
+        "Phase 1 — Contrastive Pre-training: Embedding Quality", fontsize=14, fontweight="bold"
+    )
 
     gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.3)
     ax_curve = fig.add_subplot(gs[0, 0])
@@ -143,11 +138,13 @@ def plot_comparison(
     if log is not None:
         ax_curve.plot(log["epoch"], log["train_loss"], label="train", color="#4C72B0", lw=2)
         ax_curve.plot(log["epoch"], log["val_loss"], label="val", color="#DD8452", lw=2)
-        ax_curve.axhline(BASELINE_LN64, ls="--", color="gray", lw=1, label=f"baseline ln(64)={BASELINE_LN64:.2f}")
+        ax_curve.axhline(
+            BASELINE_LN64, ls="--", color="gray", lw=1, label=f"baseline ln(64)={BASELINE_LN64:.2f}"
+        )
         ax_curve.axvline(epoch_b, ls=":", color="#2ca02c", lw=1.5, label=f"best ep.{epoch_b}")
         ax_curve.set_xlabel("Epoch")
         ax_curve.set_ylabel("InfoNCE Loss")
-        ax_curve.set_title("Val Loss — v3 Stay-level")
+        ax_curve.set_title("Val Loss — Phase 1 v4 (note-level, all-icus)")
         ax_curve.legend(fontsize=8)
         ax_curve.set_ylim(bottom=min(log["val_loss"].min() * 0.95, 2.2))
 
@@ -156,12 +153,17 @@ def plot_comparison(
     auroc_labels = [f"Epoch {epoch_a}\n(pre-training)", f"Epoch {epoch_b}\n(best)"]
     colors_auroc = ["#9ecae1", "#2171b5"]
     bars = ax_auroc.bar(auroc_labels, auroc_vals, color=colors_auroc, width=0.5)
-    # Historical reference
-    ax_auroc.axhline(0.61, ls="--", color="#d62728", lw=1.5, label="v1 linear probe 0.61")
     ax_auroc.axhline(0.5, ls=":", color="gray", lw=1, label="random 0.50")
-    for bar, val in zip(bars, auroc_vals):
-        ax_auroc.text(bar.get_x() + bar.get_width() / 2, val + 0.003,
-                      f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    for bar, val in zip(bars, auroc_vals, strict=False):
+        ax_auroc.text(
+            bar.get_x() + bar.get_width() / 2,
+            val + 0.003,
+            f"{val:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
     ax_auroc.set_ylim(0.45, min(max(auroc_vals) + 0.07, 1.0))
     ax_auroc.set_ylabel("AUROC (mortality)")
     ax_auroc.set_title("Linear Probe AUROC")
@@ -170,11 +172,17 @@ def plot_comparison(
     # --- KMeans purity bar ---
     purity_vals = [metrics_a["purity"], metrics_b["purity"]]
     bars_p = ax_purity.bar(auroc_labels, purity_vals, color=colors_auroc, width=0.5)
-    ax_purity.axhline(0.51, ls="--", color="#d62728", lw=1.5, label="v1 purity 0.51")
     ax_purity.axhline(1 - 0.1246, ls=":", color="gray", lw=1, label="majority-class 0.875")
-    for bar, val in zip(bars_p, purity_vals):
-        ax_purity.text(bar.get_x() + bar.get_width() / 2, val + 0.002,
-                       f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    for bar, val in zip(bars_p, purity_vals, strict=False):
+        ax_purity.text(
+            bar.get_x() + bar.get_width() / 2,
+            val + 0.002,
+            f"{val:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
     ax_purity.set_ylim(0.5, 1.0)
     ax_purity.set_ylabel("KMeans Purity (k=2)")
     ax_purity.set_title("Cluster Purity")
@@ -185,8 +193,15 @@ def plot_comparison(
     for ax, (coords, lbls), ep in [(ax_umap_a, umap_a, epoch_a), (ax_umap_b, umap_b, epoch_b)]:
         for lbl, color in cmap.items():
             mask = lbls == lbl
-            ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=4, alpha=0.4,
-                       label=("Died" if lbl == 1 else "Survived"), rasterized=True)
+            ax.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                c=color,
+                s=4,
+                alpha=0.4,
+                label=("Died" if lbl == 1 else "Survived"),
+                rasterized=True,
+            )
         ax.set_title(f"UMAP — Epoch {ep}")
         ax.legend(fontsize=8, markerscale=3)
         ax.set_xticks([])
@@ -195,13 +210,13 @@ def plot_comparison(
     # --- Summary table ---
     ax_table.axis("off")
     table_data = [
-        ["Metric", f"Ep. {epoch_a}", f"Ep. {epoch_b} (best)", "v1 hist."],
-        ["InfoNCE val", "—", f"{metrics_b.get('infonce_val', '—')}", "2.493"],
-        ["Baseline ln(64)", "—", f"{BASELINE_LN64:.3f}", "ln(16)=2.77"],
-        ["% reduction", "—", f"{metrics_b.get('reduction_pct', '—')}", "9.9%"],
-        ["AUROC", f"{metrics_a['auroc']:.3f}", f"{metrics_b['auroc']:.3f}", "0.61"],
-        ["KMeans purity", f"{metrics_a['purity']:.3f}", f"{metrics_b['purity']:.3f}", "0.51"],
-        ["Diag gap", f"{metrics_a['diag_gap']:.3f}", f"{metrics_b['diag_gap']:.3f}", "0.108"],
+        ["Metric", f"Ep. {epoch_a}", f"Ep. {epoch_b} (best)"],
+        ["InfoNCE val", "—", f"{metrics_b.get('infonce_val', '—')}"],
+        ["Baseline ln(64)", "—", f"{BASELINE_LN64:.3f}"],
+        ["% reduction", "—", f"{metrics_b.get('reduction_pct', '—')}"],
+        ["AUROC", f"{metrics_a['auroc']:.3f}", f"{metrics_b['auroc']:.3f}"],
+        ["KMeans purity", f"{metrics_a['purity']:.3f}", f"{metrics_b['purity']:.3f}"],
+        ["Diag gap", f"{metrics_a['diag_gap']:.3f}", f"{metrics_b['diag_gap']:.3f}"],
     ]
     tbl = ax_table.table(
         cellText=table_data[1:],
@@ -257,18 +272,26 @@ def main(args: argparse.Namespace) -> None:
     dgap_b = diagonal_gap(X_b)
 
     metrics_a = {"auroc": auroc_a, "purity": purity_a, "diag_gap": dgap_a}
-    metrics_b = {"auroc": auroc_b, "purity": purity_b, "diag_gap": dgap_b,
-                 "infonce_val": f"{best_val:.4f}" if best_val else "—",
-                 "reduction_pct": f"{(BASELINE_LN64 - best_val) / BASELINE_LN64 * 100:.1f}%" if best_val else "—"}
+    metrics_b = {
+        "auroc": auroc_b,
+        "purity": purity_b,
+        "diag_gap": dgap_b,
+        "infonce_val": f"{best_val:.4f}" if best_val else "—",
+        "reduction_pct": (
+            f"{(BASELINE_LN64 - best_val) / BASELINE_LN64 * 100:.1f}%" if best_val else "—"
+        ),
+    }
 
-    print(f"\n{'Metric':<20} {'Epoch ' + str(epoch_a):<16} {'Epoch ' + str(epoch_b):<16} {'v1 hist.'}")
-    print("-" * 65)
-    print(f"{'AUROC':<20} {auroc_a:<16.4f} {auroc_b:<16.4f} {'0.61'}")
-    print(f"{'KMeans purity':<20} {purity_a:<16.4f} {purity_b:<16.4f} {'0.51'}")
-    print(f"{'Diagonal gap':<20} {dgap_a:<16.4f} {dgap_b:<16.4f} {'0.108'}")
+    print(f"\n{'Metric':<20} {'Epoch ' + str(epoch_a):<16} {'Epoch ' + str(epoch_b):<16}")
+    print("-" * 52)
+    print(f"{'AUROC':<20} {auroc_a:<16.4f} {auroc_b:<16.4f}")
+    print(f"{'KMeans purity':<20} {purity_a:<16.4f} {purity_b:<16.4f}")
+    print(f"{'Diagonal gap':<20} {dgap_a:<16.4f} {dgap_b:<16.4f}")
     if best_val:
-        print(f"\nInfoNCE val (best ep.{epoch_b}): {best_val:.4f}  "
-              f"[{(BASELINE_LN64 - best_val) / BASELINE_LN64 * 100:.1f}% reduction vs baseline]")
+        print(
+            f"\nInfoNCE val (best ep.{epoch_b}): {best_val:.4f}  "
+            f"[{(BASELINE_LN64 - best_val) / BASELINE_LN64 * 100:.1f}% reduction vs baseline]"
+        )
 
     print("\nRunning UMAP (this takes ~1-2 min) …")
     coords_a, y_umap_a = umap_2d(X_a, y_a)
@@ -290,12 +313,22 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate Phase 1 embedding quality")
     p.add_argument(
         "--run-dir",
-        default="data/snapshots/run_20260505_213819",
-        help="Path to the training run directory (must have epoch_XXX/ subdirs)",
+        default="data/snapshots/run_20260512_200632",
+        help="Path to the training run directory (must have epoch_XXX/ subdirs). "
+        "Default: canonical Phase 1 v4 run.",
     )
-    p.add_argument("--epoch-a", type=int, default=0, help="'Before' epoch (default: 0 = pre-training)")
-    p.add_argument("--epoch-b", type=int, default=20, help="'After' epoch (default: 20 = best v3)")
-    p.add_argument("--out", default="data/plots/embedding_comparison.png", help="Output PNG path")
+    p.add_argument(
+        "--epoch-a", type=int, default=0, help="'Before' epoch (default: 0 = pre-training)"
+    )
+    p.add_argument(
+        "--epoch-b",
+        type=int,
+        default=16,
+        help="'After' epoch (default: 16 = best val InfoNCE of v4)",
+    )
+    p.add_argument(
+        "--out", default="data/plots/embedding_comparison_v4.png", help="Output PNG path"
+    )
     return p.parse_args()
 
 
