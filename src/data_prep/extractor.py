@@ -388,9 +388,7 @@ def pair_notes_signals(
         ((pl.col("event_time") - pl.col("note_time")).dt.total_seconds() / 3600.0)
         .cast(pl.Float32)
         .alias("delta_hours_to_note"),
-    ).drop(
-        "intime"
-    )  # not needed in final CSV
+    ).drop("intime")  # not needed in final CSV
 
     print(f"  Pairs: {len(paired)} (note × signal) rows")
     return paired
