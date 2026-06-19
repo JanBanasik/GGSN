@@ -9,7 +9,7 @@ Cele:
    na podstawie sąsiadów + edge attribute.
 4. Pokazać pooling + demografika + klasyfikator → prawdopodobieństwo śmierci.
 
-Skrypt CZYSTO DYDAKTYCZNY — dane syntetyczne, mały graf (7 eventów).
+Skrypt używa danych syntetycznych (7 eventów) do wizualizacji pipeline'u Phase 2.
 
 Uruchomienie:
     cd GGSN_Projektowe
@@ -47,7 +47,6 @@ from manim import (
     interpolate_color,
 )
 
-# Kolory per typ węzła (zgodne z RAPORT.md sekcja 1.2)
 SIGNAL_COLOR = BLUE
 NOTE_COLOR = GREEN
 ICD_COLOR = "#FF7F50"  # coral
@@ -107,7 +106,6 @@ class PatientGraphPipeline(Scene):
         self._scene_classify()
         self._scene_outro()
 
-    # -----------------------------------------------------------------------
     def _scene_intro(self) -> None:
         title = Text("Phase 2 — Temporal Heterogeneous GNN", font_size=38, weight="BOLD")
         sub = Text(
@@ -129,14 +127,12 @@ class PatientGraphPipeline(Scene):
         self.wait(2.0)
         self.play(FadeOut(VGroup(title, sub, eq)))
 
-    # -----------------------------------------------------------------------
     def _scene_timeline(self) -> None:
         section = Text("Krok 1: pobyt na OIOM = ciąg eventów w czasie", font_size=24).to_edge(
             UP, buff=0.3
         )
         self.play(FadeIn(section))
 
-        # Oś czasu
         axis = Line([X_LEFT, -1.6, 0], [X_RIGHT, -1.6, 0], color=GREY, stroke_width=2)
         t_min_lab = Text("t = -1h (ICD)", font_size=14, color=GREY).next_to(
             axis.get_start(), DOWN, buff=0.2
@@ -152,7 +148,6 @@ class PatientGraphPipeline(Scene):
         self.play(Create(axis), FadeIn(t_min_lab), FadeIn(t_max_lab))
         self.play(FadeIn(intime_mark), FadeIn(intime_lab))
 
-        # Legenda 3 typów węzłów
         legend_items = [
             (SIGNAL_COLOR, "signal node — [one_hot(14) | val | t/24] → R¹⁶"),
             (NOTE_COLOR, "note node — embedding z Phase 1 → R¹²⁸"),
@@ -169,17 +164,14 @@ class PatientGraphPipeline(Scene):
         self.wait(1.5)
 
         self.play(FadeOut(VGroup(legend, section)))
-        # Zostaw oś — będzie używana w następnej scenie
         self._axis_group = VGroup(axis, t_min_lab, t_max_lab, intime_mark, intime_lab)
 
-    # -----------------------------------------------------------------------
     def _scene_build_graph(self) -> None:
         section = Text("Krok 2: budowa heterogenicznego grafu temporalnego", font_size=24).to_edge(
             UP, buff=0.3
         )
         self.play(FadeIn(section))
 
-        # Pojawiają się węzły jeden po drugim (w kolejności czasowej)
         self._nodes: list[VGroup] = []
         sorted_events = sorted(EVENTS, key=lambda e: e[1])
         for ev in sorted_events:
@@ -198,7 +190,6 @@ class PatientGraphPipeline(Scene):
 
         self.wait(0.5)
 
-        # Teraz krawędzie temporalne — wszystkie pary (i,j) z t_i < t_j
         sub = Text(
             "Krawędzie: skierowane (wcześniejszy → późniejszy),  edge_attr = Δt/24h",
             font_size=18,
@@ -211,7 +202,6 @@ class PatientGraphPipeline(Scene):
         for i in range(n_events):
             new_edges = VGroup()
             for j in range(i + 1, n_events):
-                # Oblicz dt
                 _, t_i, _ = sorted_events[i]
                 _, t_j, _ = sorted_events[j]
                 dt = t_j - t_i
@@ -231,7 +221,6 @@ class PatientGraphPipeline(Scene):
                 self.play(Create(new_edges), run_time=0.4)
                 self._edges.add(*new_edges)
 
-        # Stats
         n_nodes = len(self._nodes)
         n_edges = n_nodes * (n_nodes - 1) // 2
         stats = Text(
@@ -244,7 +233,6 @@ class PatientGraphPipeline(Scene):
 
         self.play(FadeOut(VGroup(section, sub, stats, self._axis_group)))
 
-    # -----------------------------------------------------------------------
     def _scene_message_passing(self) -> None:
         section = Text("Krok 3: GINEConv × 3 — message passing z edge attributes", font_size=24)
         section.to_edge(UP, buff=0.3)
@@ -258,17 +246,14 @@ class PatientGraphPipeline(Scene):
         self.play(Write(formula))
         self.wait(0.8)
 
-        # Wybierz "fokus" node = note₁ (środek grafu czasowo)
         focus_idx = next(
             i for i, e in enumerate(sorted(EVENTS, key=lambda e: e[1])) if e[2] == "note₁"
         )
         focus = self._nodes[focus_idx][0][0]  # circle
 
-        # Podświetl fokus
         focus_ring = Circle(radius=0.32, color=YELLOW, stroke_width=4).move_to(focus.get_center())
         self.play(Create(focus_ring))
 
-        # Pokaż 3 iteracje message passing
         for layer in range(1, 4):
             layer_text = Text(
                 f"Warstwa {layer}/3 — agregacja od sąsiadów",
@@ -277,13 +262,11 @@ class PatientGraphPipeline(Scene):
             ).to_edge(DOWN, buff=0.4)
             self.play(FadeIn(layer_text))
 
-            # Animuj "wiadomości" płynące do fokusu od wszystkich pozostałych
             messages = VGroup()
             for i, node_grp in enumerate(self._nodes):
                 if i == focus_idx:
                     continue
                 src_circle = node_grp[0][0]
-                # Mała kropka która "leci" od src do focus
                 msg = Dot(point=src_circle.get_center(), radius=0.07, color=src_circle.color)
                 messages.add(msg)
             self.add(messages)
@@ -292,34 +275,27 @@ class PatientGraphPipeline(Scene):
             for i, msg in enumerate(messages):
                 idx = i if i < focus_idx else i + 1
                 src_pos = self._nodes[idx][0][0].get_center()
-                # Refresh src pos w razie ruchu
                 msg.move_to(src_pos)
                 anims.append(msg.animate.move_to(focus.get_center()))
             self.play(*anims, run_time=1.0)
 
-            # Po dotarciu: pulse fokusu (embedding się aktualizuje)
             self.play(Indicate(focus, color=YELLOW, scale_factor=1.3), run_time=0.5)
             self.play(FadeOut(messages), FadeOut(layer_text), run_time=0.3)
 
         self.wait(0.5)
         self.play(FadeOut(VGroup(section, formula, focus_ring)))
 
-    # -----------------------------------------------------------------------
     def _scene_classify(self) -> None:
         section = Text("Krok 4: pooling + demografika → klasyfikator", font_size=24).to_edge(
             UP, buff=0.3
         )
         self.play(FadeIn(section))
 
-        # Wszystkie węzły grafu pulsują, potem zwijają się do jednego wektora "g"
-        graph_group = VGroup(*[n[0] for n in self._nodes])
         for n in self._nodes:
             n[1].set_opacity(0.0)  # ukryj kreseczki
 
-        # Wszystkie krawędzie znikają
         self.play(FadeOut(self._edges))
 
-        # Pooling: węzły lecą do jednego punktu (attention pooling)
         pool_target = np.array([-2.0, -0.5, 0.0])
         anims = [n[0].animate.move_to(pool_target).scale(0.4) for n in self._nodes]
         pool_label = Text("AttentionalAggregation", font_size=18, color=YELLOW).move_to(
@@ -327,7 +303,6 @@ class PatientGraphPipeline(Scene):
         )
         self.play(*anims, FadeIn(pool_label), run_time=1.2)
 
-        # Wektor "g" w R^128
         g_box = Rectangle(width=1.6, height=0.5, color=YELLOW, stroke_width=3).set_fill(
             YELLOW, opacity=0.15
         )
@@ -335,7 +310,6 @@ class PatientGraphPipeline(Scene):
         g_label = Text("g ∈ R¹²⁸", font_size=18, color=YELLOW).move_to(g_box.get_center())
         self.play(FadeOut(VGroup(*[n[0] for n in self._nodes])), Create(g_box), FadeIn(g_label))
 
-        # Demografika obok
         demo_box = Rectangle(width=1.2, height=0.5, color=DEMO_COLOR, stroke_width=3).set_fill(
             DEMO_COLOR, opacity=0.15
         )
@@ -348,7 +322,6 @@ class PatientGraphPipeline(Scene):
         )
         self.play(Create(demo_box), FadeIn(demo_label), FadeIn(demo_sub))
 
-        # Concat → klasyfikator
         concat_arrow_g = Arrow(
             g_box.get_right(),
             [g_box.get_right()[0] + 0.7, g_box.get_right()[1], 0],
@@ -372,7 +345,6 @@ class PatientGraphPipeline(Scene):
             Create(concat_arrow_g), Create(concat_arrow_d), Create(concat_box), FadeIn(concat_label)
         )
 
-        # Klasyfikator
         clf_arrow = Arrow(
             concat_box.get_right(),
             [concat_box.get_right()[0] + 0.8, concat_box.get_right()[1], 0],
@@ -387,7 +359,6 @@ class PatientGraphPipeline(Scene):
         clf_lab = Text("Linear(132→32→1)", font_size=15, color=WHITE).move_to(clf_box.get_center())
         self.play(Create(clf_arrow), Create(clf_box), FadeIn(clf_lab))
 
-        # Output: prawdopodobieństwo śmierci
         prob_arrow = Arrow(
             clf_box.get_right(),
             [clf_box.get_right()[0] + 0.7, clf_box.get_right()[1], 0],
@@ -406,7 +377,6 @@ class PatientGraphPipeline(Scene):
         self.play(Create(prob_arrow), Create(prob_box), FadeIn(prob_lab), FadeIn(prob_sub))
 
         self.wait(2.0)
-        # Sprzątanie
         self.play(
             FadeOut(
                 VGroup(
@@ -432,12 +402,10 @@ class PatientGraphPipeline(Scene):
             )
         )
 
-    # -----------------------------------------------------------------------
     def _scene_outro(self) -> None:
         title = Text("Wynik na MIMIC-IV (52 727 pobytów)", font_size=32, weight="BOLD")
         title.to_edge(UP, buff=1.0)
 
-        # 3 metryki w boxach
         metrics = [
             ("AUROC", "0.850", GREEN),
             ("AUPRC", "0.465", BLUE),

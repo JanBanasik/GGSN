@@ -116,8 +116,6 @@ class TemporalPatientGNN(nn.Module):
         if self.pooling == "attention":
             g = self.pool(h, batch)
         elif self.pooling == "dual":
-            # Pool only signal and note nodes; ICD node already propagated its info via GNN
-            sig_mask | note_mask
             note_g = global_mean_pool(h[note_mask], batch[note_mask], size=B)
             sig_g = global_mean_pool(h[sig_mask], batch[sig_mask], size=B)
             g = torch.cat([note_g, sig_g], dim=-1)

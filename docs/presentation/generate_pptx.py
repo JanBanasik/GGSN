@@ -4,14 +4,16 @@ generate_pptx.py
 Minimal startup-style PowerPoint dla projektu GGSN Temporal GNN.
 
 Uruchomienie:
-    uv run python generate_pptx.py
+    uv run --extra presentation python docs/presentation/generate_pptx.py
 
-Wyjście: presentation.pptx
+Wyjście: docs/presentation/presentation.pptx
+Ustaw GGSN_PRESENTATION_OUT, aby zapisać plik w innej lokalizacji.
 """
 
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 
 import matplotlib
@@ -26,7 +28,8 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
 
-OUT = Path(__file__).parent / "presentation.pptx"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OUT = Path(os.environ.get("GGSN_PRESENTATION_OUT", Path(__file__).parent / "presentation.pptx"))
 
 # ─── Color palette (minimal white / startup) ──────────────────────────────────
 W, H = Inches(13.33), Inches(7.5)  # 16:9
@@ -130,7 +133,7 @@ def chart_auroc() -> io.BytesIO:
     ax.text(0.8815, len(names) - 0.6, "SOTA 0.88", color="#64748B", fontsize=8.5, va="top")
     ax.axvline(0.829, color="#6366F1", lw=1, ls=":", alpha=0.45, zorder=4)
 
-    for bar, v, g in zip(bars, aurocs, groups):
+    for bar, v, g in zip(bars, aurocs, groups, strict=True):
         fw = "bold" if g in ("best", "baseline") else "normal"
         fc = "#1E40AF" if g == "best" else "#0F172A"
         ax.text(
@@ -190,7 +193,7 @@ def chart_auprc() -> io.BytesIO:
     ax.axvline(0.127, color="#1E40AF", lw=1.5, ls="--", alpha=0.7, zorder=4)
     ax.text(0.134, len(names) - 0.6, "random 0.127", color="#1E40AF", fontsize=8.5, va="top")
 
-    for i, (v, g) in enumerate(zip(auprcs, groups)):
+    for i, (v, g) in enumerate(zip(auprcs, groups, strict=True)):
         fc = "#1E40AF" if g == "best" else "#0F172A"
         fw = "bold" if g == "best" else "normal"
         ax.text(
@@ -237,7 +240,7 @@ def chart_leakage() -> io.BytesIO:
         "Temporal leakage bug", fontsize=13, pad=12, fontweight="bold", color="#0F172A", loc="left"
     )
 
-    for bar, v, c in zip(bars, vals, colors):
+    for bar, v, c in zip(bars, vals, colors, strict=True):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             v + 0.005,
@@ -282,7 +285,7 @@ def chart_contributions() -> io.BytesIO:
     ax.barh(range(len(labels)), deltas, color=colors, height=0.58, zorder=3)
     ax.axvline(0, color="#94A3B8", lw=1.5, zorder=4)
 
-    for i, (d, c) in enumerate(zip(deltas, colors)):
+    for i, (d, c) in enumerate(zip(deltas, colors, strict=True)):
         off = 0.0008 if d >= 0 else -0.0008
         ha = "left" if d >= 0 else "right"
         ax.text(
@@ -316,7 +319,7 @@ def chart_sota() -> io.BytesIO:
         "Nasz wynik vs SOTA", fontsize=13, pad=12, fontweight="bold", color="#0F172A", loc="left"
     )
 
-    for bar, v, c in zip(bars, vals, colors):
+    for bar, v, c in zip(bars, vals, colors, strict=True):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             v + 0.012,
@@ -343,8 +346,8 @@ def chart_sota() -> io.BytesIO:
 def chart_learning_curve() -> io.BytesIO:
     import csv
 
-    path = Path(__file__).parent / "data" / "snapshots" / "gnn" / "version_14" / "metrics.csv"
-    rows = list(csv.DictReader(path.open()))
+    path = PROJECT_ROOT / "data" / "snapshots" / "gnn" / "version_14" / "metrics.csv"
+    rows = list(csv.DictReader(path.open())) if path.is_file() else []
 
     val_epochs, val_auroc = [], []
     train_epochs, train_loss = [], []
@@ -358,6 +361,30 @@ def chart_learning_curve() -> io.BytesIO:
             train_loss.append(float(r["train_loss"]))
 
     fig, ax1 = plt.subplots(figsize=(10, 4.6))
+    if not val_auroc:
+        ax1.axis("off")
+        ax1.text(
+            0.5,
+            0.55,
+            "Krzywa uczenia wymaga lokalnego pliku metrics.csv",
+            ha="center",
+            va="center",
+            fontsize=17,
+            fontweight="bold",
+            color="#0F172A",
+        )
+        ax1.text(
+            0.5,
+            0.42,
+            "Logi eksperymentów nie są dystrybuowane z publicznym repozytorium.",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color="#64748B",
+        )
+        fig.tight_layout()
+        return _png(fig)
+
     ax2 = ax1.twinx()
 
     ax1.plot(
@@ -426,6 +453,137 @@ def chart_learning_curve() -> io.BytesIO:
     return _png(fig)
 
 
+def chart_calibration() -> io.BytesIO:
+    """Reliability diagram: best model (focal γ=2) vs no-focal variant (γ=0)."""
+    import sys
+
+    from sklearn.calibration import calibration_curve
+
+    CACHE = PROJECT_ROOT / "data" / "processed" / "calibration_cache.npz"
+
+    if CACHE.exists():
+        d = np.load(CACHE)
+        y_true = d["y_true"]
+        proba_focal = d["proba_focal"]
+        proba_nofocal = d["proba_nofocal"]
+        print("  [chart_calibration] załadowano z cache.")
+    else:
+        print("  [chart_calibration] uruchamianie inferencji (~30s)…")
+        proj_root = PROJECT_ROOT
+        if str(proj_root) not in sys.path:
+            sys.path.insert(0, str(proj_root))
+
+        import torch
+        from torch_geometric.loader import DataLoader  # noqa: E402
+
+        from src.models.gnn_module import GNNMortalityModule  # noqa: E402
+        from src.utils.gnn_dataset import build_datasets  # noqa: E402
+
+        _, val_data, _ = build_datasets(
+            PROJECT_ROOT / "data/processed/pairs_all-icus_note_level.csv",
+            PROJECT_ROOT / "data/embeddings/node_embeddings.pt",
+            demo_path=PROJECT_ROOT / "data/processed/demographics.csv",
+            cache_path=PROJECT_ROOT / "data/processed/graphs_cache_demo.pt",
+            seed=42,
+            train_ratio=0.8,
+        )
+        val_loader = DataLoader(val_data, batch_size=64, shuffle=False)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def _infer(ckpt):
+            m = GNNMortalityModule.load_from_checkpoint(str(ckpt), map_location=device)
+            m.eval()
+            logits_all, labels_all = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(device)
+                    logits_all.append(m(batch).cpu())
+                    labels_all.append(batch.y.cpu())
+            logits = torch.cat(logits_all).numpy()
+            labels = torch.cat(labels_all).numpy()
+            return torch.sigmoid(torch.from_numpy(logits)).numpy(), labels
+
+        # version_10: attention + demo + focal γ=2 (best model, AUROC 0.850)
+        proba_focal, y_true = _infer(
+            PROJECT_ROOT / "data/snapshots/gnn/version_10/checkpoints/best.ckpt"
+        )
+        # version_6: attention + demo + γ=0 (same arch, no focal, AUROC 0.844)
+        proba_nofocal, _ = _infer(
+            PROJECT_ROOT / "data/snapshots/gnn/version_6/checkpoints/best.ckpt"
+        )
+        np.savez(CACHE, y_true=y_true, proba_focal=proba_focal, proba_nofocal=proba_nofocal)
+        print(f"  [chart_calibration] zapisano cache → {CACHE}")
+
+    def _ece(y, p, n_bins=10):
+        bins = np.linspace(0, 1, n_bins + 1)
+        e = 0.0
+        for i in range(n_bins):
+            mask = (p >= bins[i]) & (p < bins[i + 1])
+            if mask.sum():
+                e += mask.mean() * abs(y[mask].mean() - p[mask].mean())
+        return e
+
+    n_bins = 10
+    frac_f, mean_f = calibration_curve(y_true, proba_focal, n_bins=n_bins)
+    frac_nf, mean_nf = calibration_curve(y_true, proba_nofocal, n_bins=n_bins)
+    ece_f = _ece(y_true, proba_focal)
+    ece_nf = _ece(y_true, proba_nofocal)
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.0))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    # Soft histogram of predicted probabilities (push to bottom via ylim scaling)
+    ax2 = ax.twinx()
+    ax2.hist(proba_focal, bins=20, alpha=0.10, color="#4F46E5", density=True)
+    ax2.set_yticks([])
+    ax2.set_ylim(0, ax2.get_ylim()[1] * 6)
+
+    # Perfect calibration diagonal
+    ax.plot([0, 1], [0, 1], "k--", lw=1.2, alpha=0.4, label="Idealna kalibracja", zorder=2)
+
+    # Model curves (no-focal first so focal renders on top)
+    ax.plot(
+        mean_nf,
+        frac_nf,
+        "s--",
+        color="#06B6D4",
+        lw=2.0,
+        ms=7,
+        zorder=4,
+        label=f"BCE + pos_weight  (γ=0)   ECE = {ece_nf:.3f}",
+    )
+    ax.plot(
+        mean_f,
+        frac_f,
+        "o-",
+        color="#4F46E5",
+        lw=2.2,
+        ms=8,
+        zorder=5,
+        label=f"Focal Loss         (γ=2)   ECE = {ece_f:.3f}",
+    )
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Przewidywane prawdopodobieństwo", fontsize=11, color="#475569")
+    ax.set_ylabel("Rzeczywista frakcja pozytywów", fontsize=11, color="#475569")
+    ax.set_title(
+        "Diagram rzetelności (reliability diagram)",
+        fontsize=13,
+        fontweight="bold",
+        color="#0B0F1E",
+        loc="left",
+        pad=10,
+    )
+    ax.legend(frameon=True, fontsize=10, loc="upper left", facecolor="white", edgecolor="#E2E8F0")
+    ax.grid(True, alpha=0.4, color="#E2E8F0")
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    return _png(fig)
+
+
 def chart_similarity() -> io.BytesIO:
     """
     50×50 cosine similarity matrix: 10 stays × 5 notatek per stay.
@@ -433,7 +591,7 @@ def chart_similarity() -> io.BytesIO:
     """
     import pandas as pd
 
-    root = Path(__file__).parent
+    root = PROJECT_ROOT
     cache = root / "data" / "processed" / "simmat_cache.npz"
     emb_path = root / "data" / "embeddings" / "node_embeddings.pt"
     pairs_path = root / "data" / "processed" / "pairs_all-icus_note_level.csv"
@@ -452,7 +610,7 @@ def chart_similarity() -> io.BytesIO:
 
         note_to_stay: dict[str, str] = {}
         for chunk in pd.read_csv(pairs_path, usecols=["note_id", "stay_id"], chunksize=2_000_000):
-            for nid, sid in zip(chunk["note_id"].values, chunk["stay_id"].values):
+            for nid, sid in zip(chunk["note_id"].values, chunk["stay_id"].values, strict=True):
                 if nid not in note_to_stay:
                     note_to_stay[nid] = str(sid)
 
@@ -580,7 +738,7 @@ def chart_umap() -> io.BytesIO:
     """PCA-2D projekcja embeddingów notatek po Phase 1, kolorowana mortality."""
     from sklearn.decomposition import PCA
 
-    root = Path(__file__).parent
+    root = PROJECT_ROOT
     emb_path = root / "data" / "embeddings" / "node_embeddings.pt"
     pairs_path = root / "data" / "processed" / "pairs_all-icus_note_level.csv"
     cache = root / "data" / "processed" / "pca2d_cache.npz"
@@ -720,23 +878,23 @@ def diagram_twotower() -> io.BytesIO:
             arrowprops=dict(arrowstyle="-|>", color=color, lw=lw, mutation_scale=14),
         )
 
-    # ── Inputs (top)
+    # ── Inputs (top) — h=1.1 gives title+sub a 0.27-unit gap (was 0.07 at h=0.9)
     box(
         0.3,
-        4.5,
+        4.3,
         3.2,
-        0.9,
+        1.1,
         "#F0F9FF",
         "#BAE6FD",
         "Notatka kliniczna",
         '"Patient appears acutely ill..."',
         "#0369A1",
     )
-    box(7.5, 4.5, 3.2, 0.9, ACC_L, ACC_B, "Sygnaly fizjologiczne", "HR=82, SpO2=97, MAP=68", ACC)
+    box(7.5, 4.3, 3.2, 1.1, ACC_L, ACC_B, "Sygnaly fizjologiczne", "HR=82, SpO2=97, MAP=68", ACC)
 
-    # ── Arrows input → tower
-    arr(1.9, 4.5, 1.9, 3.92)
-    arr(9.1, 4.5, 9.1, 3.92)
+    # ── Arrows input → tower (from bottom of input boxes at y=4.3)
+    arr(1.9, 4.3, 1.9, 3.92)
+    arr(9.1, 4.3, 9.1, 3.92)
 
     # ── Tower boxes (generous height)
     box(
@@ -913,23 +1071,6 @@ def diagram_graph() -> io.BytesIO:
     ax.text(3.5, 2.3, "Δt/24", fontsize=8, color="#94A3B8", ha="center", rotation=15)
 
     # Legend
-    legend_items = [
-        (plt.Circle((0, 0), 0.1, color="#06B6D4", alpha=0.15), "Sygnał (vital/lab) — 16-dim"),
-        (
-            FancyPatch.FancyBboxPatch(
-                (0, 0), 0.2, 0.2, boxstyle="round", facecolor="#EEF2FF", edgecolor="#818CF8"
-            ),
-            "Notatka — 128-dim",
-        ),
-        (
-            plt.Polygon(
-                [(0, 0.1), (0.1, 0), (0.2, 0.1), (0.1, 0.2)],
-                facecolor="#EEF2FF",
-                edgecolor="#818CF8",
-            ),
-            "ICD Charlson — 19-dim",
-        ),
-    ]
     legend_proxies = [
         mpatches.Patch(color="#06B6D4", alpha=0.5, label="Sygnał (vital/lab) — 16-dim"),
         mpatches.Patch(color="#818CF8", alpha=0.5, label="Notatka kliniczna — 128-dim"),
@@ -2191,6 +2332,39 @@ def slide_learning_curve(prs, charts):
     )
 
 
+def slide_calibration(prs, charts):
+    s = new_slide(prs)
+    tag(s, "Kalibracja", PAD, Inches(0.5))
+    txt(
+        s,
+        "Kalibracja prawdopodobieństw — Focal vs BCE",
+        PAD,
+        Inches(0.85),
+        Inches(11),
+        Inches(0.7),
+        size=30,
+        bold=True,
+        color=C_INK,
+    )
+    line(s, PAD, Inches(1.55), Inches(12.63), Inches(1.55))
+
+    img(s, charts["calibration"], Inches((13.33 - 9.5) / 2), Inches(1.62), Inches(9.5))
+
+    txt(
+        s,
+        "Focal Loss poprawia AUROC (+0.006) kosztem kalibracji — ECE rośnie, krzywa odchyla się od "
+        "przekątnej. BCE z pos_weight jest lepiej skalibrowane (niższy ECE, niższy Brier = 0.170).",
+        PAD,
+        Inches(6.9),
+        Inches(11.93),
+        Inches(0.4),
+        size=12,
+        italic=True,
+        color=C_LIGHT,
+        align=PP_ALIGN.CENTER,
+    )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -2225,9 +2399,9 @@ def main():
     slide_bug(prs, charts)
     slide_auroc(prs, charts)
     slide_auprc(prs, charts)
-    slide_learning_curve(prs, charts)
     slide_contributions(prs, charts)
     slide_best_model(prs, charts)
+    slide_learning_curve(prs, charts)
     slide_sota(prs, charts)
     slide_takeaways(prs, charts)
 
@@ -2235,7 +2409,7 @@ def main():
     assert len(prs.slides) == len(SLIDE_NOTES), (
         f"Liczba slajdów ({len(prs.slides)}) != liczba notatek ({len(SLIDE_NOTES)})"
     )
-    for slide, notes in zip(prs.slides, SLIDE_NOTES):
+    for slide, notes in zip(prs.slides, SLIDE_NOTES, strict=True):
         _add_notes(slide, notes)
     print(f"  Notatki: {len(SLIDE_NOTES)} slajdów.")
 
@@ -2501,26 +2675,7 @@ jest spjna: model 3.6x powyzej losowego w precision-recall.
 Gdyby AUROC byl zawyzona przez TN (False Negative problem), widzielibysmy
 niska AUPRC — a mamy 0.465 czyli wyraznie powyzej 0.127.
 """,
-    # 11 — Learning Curve
-    """\
-CO POKAZUJE KRZYWA UCZENIA?
-Niebieski: val AUROC na zbiorze walidacyjnym po kazdej epoce.
-Szary (cienki): train loss (Focal Loss na zbiorze treningowym).
-Najlepszy punkt: zaznaczony granatowym krolkiem.
-
-CZY MODEL SIE PRZETRENOWUJE?
-Val AUROC stabilizuje sie okolo 0.845 od ~40 epoki i dalej nieznacznie rosnie.
-Train loss maleje monotonicznie — model dalej sie uczy, ale val AUROC nie
-spada — brak overfittingu. Dropout 0.3, early stopping patience=15 zapewniaja
-regularyzacje.
-
-DLACZEGO WYNIKI 10 I 14 SA ROZNE MIMO IDENTYCZNYCH HPARAMS?
-Version_10: AUROC 0.850, version_14: AUROC 0.848. Roznica 0.002 AUROC.
-To jest wariancja losowa — seed deterministyczny ale PyG/CUDA operacje
-mog miec niezbyt reprodukowalny wynik. Roznica mniejsza niz 0.003 jest
-nieistotna statystycznie. Oznacza to ze nasz wynik jest stabilny.
-""",
-    # 12 — Contributions
+    # 11 — Contributions
     """\
 DLACZEGO ICD NODE NIE POMAGA?
 56.4% pobytow ma zerowy wektor Charlson (brak zapisanych chorob przewleklych).
@@ -2548,7 +2703,7 @@ przypadkow pozytywnych — stad poprawa recallu przy danym progu specyficznosci.
 Nie zmienia dramatycznie AUROC (globalny ranking), ale poprawia kliniczne
 punkt decyzyjny.
 """,
-    # 13 — Best Model
+    # 12 — Best Model
     """\
 CZEMU AKURAT ATTENTION A NIE DUAL POOLING?
 Dual pooling (osobne pule dla nodow sygnalow i notatek, konkatenowane) daje
@@ -2572,6 +2727,25 @@ poprawy przez 5 epok (patience=5, factor=0.5). Jest adaptacyjny — nie wymaga
 ustalonego harmonogramu. Cosine decay bylby odpowiedni gdybysmy znali dokladna
 liczbe epok z gory; tutaj early stopping z patience=15 przerywa trening
 w roznych momentach dla roznych eksperymentow.
+""",
+    # 13 — Learning Curve
+    """\
+CO POKAZUJE KRZYWA UCZENIA?
+Niebieski: val AUROC na zbiorze walidacyjnym po kazdej epoce.
+Szary (cienki): train loss (Focal Loss na zbiorze treningowym).
+Najlepszy punkt: zaznaczony granatowym krolkiem.
+
+CZY MODEL SIE PRZETRENOWUJE?
+Val AUROC stabilizuje sie okolo 0.845 od ~40 epoki i dalej nieznacznie rosnie.
+Train loss maleje monotonicznie — model dalej sie uczy, ale val AUROC nie
+spada — brak overfittingu. Dropout 0.3, early stopping patience=15 zapewniaja
+regularyzacje.
+
+DLACZEGO WYNIKI 10 I 14 SA ROZNE MIMO IDENTYCZNYCH HPARAMS?
+Version_10: AUROC 0.850, version_14: AUROC 0.848. Roznica 0.002 AUROC.
+To jest wariancja losowa — seed deterministyczny ale PyG/CUDA operacje
+mog miec niezbyt reprodukowalny wynik. Roznica mniejsza niz 0.003 jest
+nieistotna statystycznie. Oznacza to ze nasz wynik jest stabilny.
 """,
     # 14 — vs SOTA
     """\

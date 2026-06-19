@@ -64,9 +64,6 @@ def _grad_scaler_cuda(enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint helpers (resume training across sessions)
-# ---------------------------------------------------------------------------
 CHECKPOINT_NAME = "checkpoint.pt"
 CKPT_LOCKED_KEYS = (
     "batch_size",
@@ -86,7 +83,7 @@ CKPT_LOCKED_KEYS = (
 
 
 def save_checkpoint(path: Path, **state) -> None:
-    """Atomic write: write to .tmp then rename, so Ctrl-C can't corrupt."""
+    """Write checkpoint atomically via a temporary file."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(state, tmp)
     tmp.replace(path)
@@ -131,9 +128,6 @@ def validate_resume_config(ckpt_config: dict, current_config: dict, force: bool)
     print(f"[resume] WARNING (--force):\n{msg}")
 
 
-# ---------------------------------------------------------------------------
-# Hyper-parameter defaults
-# ---------------------------------------------------------------------------
 EPOCHS = 25
 BATCH_SIZE = 16
 MAX_TEXT_LEN = 256
@@ -174,9 +168,6 @@ def git_sha() -> str:
         return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
 def train(
     csv_path: Path,
     snapshots_root: Path,
@@ -235,7 +226,6 @@ def train(
         run_dir.mkdir(parents=True, exist_ok=True)
         print(f"Run dir: {run_dir}")
 
-    # --- Data ---
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
     dataset = ContrastivePairsDataset(
         csv_path, tokenizer, max_text_len=max_text_len, seq_len=seq_len
@@ -264,7 +254,6 @@ def train(
     sim_indices = sim_pool[:sim_matrix_n] if len(sim_pool) >= sim_matrix_n else sim_pool
     print(f"  Similarity-matrix snapshot N: {len(sim_indices)}")
 
-    # --- Models ---
     text_tower = TextTower(
         embed_dim=embed_dim,
         freeze_bert=freeze_bert,
@@ -301,7 +290,6 @@ def train(
     amp_enabled = use_amp and device.type == "cuda"
     scaler = _grad_scaler_cuda(amp_enabled)
 
-    # --- Config ---
     config = {
         "run_id": run_id,
         "git_sha": git_sha(),
@@ -390,7 +378,6 @@ def train(
             run_dir, 0, text_tower, signal_tower, dataset, val_idx, sim_indices, batch_size, device
         )
 
-    # --- Hard negative state ---
     hard_neg_table: torch.Tensor | None = None
     hard_neg_seed = seed * 1000 + 7
 
@@ -408,7 +395,6 @@ def train(
             dataset, batch_sampler=sampler, num_workers=2, pin_memory=(device.type == "cuda")
         )
 
-    # --- Training loop ---
     print(
         f"\nTraining {start_epoch}..{epochs} | train={len(train_idx)} val={len(val_idx)} "
         f"| batch={batch_size} × accum={grad_accum_steps} = effective {effective_batch} "
@@ -613,9 +599,6 @@ def train(
     return run_dir
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def apply_training_preset(ns: argparse.Namespace) -> None:
     if ns.preset != "low-data-bert":
         return
@@ -670,6 +653,11 @@ if __name__ == "__main__":
         if args.csv_path
         else PROJECT_ROOT / "data" / "processed" / "pairs_all-icus_note_level.csv"
     )
+    if not csv_path.is_file():
+        raise SystemExit(
+            f"Input CSV not found: {csv_path}\n"
+            "Run src.data_prep.extractor first or pass --csv-path."
+        )
     train(
         csv_path=csv_path,
         snapshots_root=PROJECT_ROOT / "data" / "snapshots",

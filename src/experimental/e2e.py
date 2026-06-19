@@ -34,9 +34,7 @@ from src.models.towers import EMBED_DIM, NUM_SIGNAL_TYPES, TYPE_EMBED_DIM, TextT
 from src.utils.gnn_dataset import _preprocess_csv, _subject_split
 from src.utils.graph_builder import NODE_DIM, SIGNAL_VAL_DIM
 
-# ---------------------------------------------------------------------------
 # E2E Graph builder
-# ---------------------------------------------------------------------------
 
 
 def build_patient_graph_e2e(
@@ -142,9 +140,7 @@ def build_patient_graph_e2e(
     )
 
 
-# ---------------------------------------------------------------------------
 # E2E Dataset builder
-# ---------------------------------------------------------------------------
 
 
 def build_datasets_e2e(
@@ -252,9 +248,7 @@ def build_datasets_e2e(
     return train_graphs, val_graphs, pos_weight
 
 
-# ---------------------------------------------------------------------------
 # E2E Model
-# ---------------------------------------------------------------------------
 
 
 class TemporalPatientGNNE2E(nn.Module):

@@ -25,8 +25,6 @@ import argparse
 import warnings
 from pathlib import Path
 
-# Graphs are pre-loaded into RAM as Python lists — extra DataLoader workers
-# would just fork-copy the whole dataset for no gain (and cause WSL2 issues).
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
 import lightning as L
@@ -110,9 +108,22 @@ def main() -> None:
         "--precision",
         default="32",
         choices=["32", "16-mixed", "bf16-mixed"],
-        help="Mixed precision: 16-mixed enables AMP (Enhancement #5 prerequisite)",
+        help="Mixed precision: 16-mixed enables AMP",
     )
     args = p.parse_args()
+
+    input_paths = {
+        "--csv-path": args.csv_path,
+        "--embeddings-path": args.embeddings_path,
+        "--demo-path": args.demo_path,
+        "--icd-path": args.icd_path,
+        "--all-stay-path": args.all_stay_path,
+    }
+    missing = [
+        f"{flag}={path}" for flag, path in input_paths.items() if path and not Path(path).is_file()
+    ]
+    if missing:
+        p.error("input file(s) not found: " + ", ".join(missing))
 
     dm = MIMICGraphDataModule(
         csv_path=args.csv_path,

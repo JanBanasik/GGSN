@@ -8,9 +8,7 @@ Cele:
    negatives odpychane.
 4. Pokazać macierz podobieństw NxN i jej "świecenie" przekątnej po treningu.
 
-Skrypt jest CZYSTO DYDAKTYCZNY — używa danych syntetycznych, nie ładuje snapshotów.
-Cel: dać widzom intuicję "co to InfoNCE i jak działa Two-Tower" przed pokazaniem
-realnych animacji similarity / UMAP.
+Skrypt używa danych syntetycznych do wizualizacji architektury Two-Tower i InfoNCE.
 
 Uruchomienie:
     cd GGSN_Projektowe
@@ -78,7 +76,6 @@ class TwoTowerInfoNCE(Scene):
         self._scene_shared_space()
         self._scene_similarity_matrix()
 
-    # -----------------------------------------------------------------------
     def _scene_intro(self) -> None:
         title = Text("Two-Tower Contrastive Pre-training", font_size=40, weight="BOLD")
         sub = Text(
@@ -98,7 +95,6 @@ class TwoTowerInfoNCE(Scene):
         self.wait(2.0)
         self.play(FadeOut(VGroup(title, sub, formula)))
 
-    # -----------------------------------------------------------------------
     def _scene_towers(self) -> None:
         section = Text("Krok 1: Batch B=4 par przepływa przez wieże", font_size=24).to_edge(
             UP, buff=0.3
@@ -112,7 +108,6 @@ class TwoTowerInfoNCE(Scene):
             RIGHT * 4 + UP * 0.2
         )
 
-        # 4 input "tokens" po lewej / 4 input "spike traces" po prawej
         text_inputs = VGroup()
         sig_inputs = VGroup()
         for i in range(BATCH):
@@ -132,7 +127,6 @@ class TwoTowerInfoNCE(Scene):
         self.play(Create(text_tower), Create(sig_tower))
         self.play(FadeIn(text_inputs), FadeIn(sig_inputs))
 
-        # Strzałki wejść do wież
         in_arrows_l = VGroup(
             *[
                 Arrow(
@@ -161,7 +155,6 @@ class TwoTowerInfoNCE(Scene):
         )
         self.play(Create(in_arrows_l), Create(in_arrows_r))
 
-        # Wyjścia: małe pudełka z napisem (B, 128) na środku
         out_text = Text("z_text\n(B, 128)\nL2-norm", font_size=14, color=BLUE).next_to(
             text_tower, DOWN, buff=0.5
         )
@@ -187,27 +180,23 @@ class TwoTowerInfoNCE(Scene):
             )
         )
 
-    # -----------------------------------------------------------------------
     def _scene_shared_space(self) -> None:
         section = Text(
             "Krok 2: Wspólna przestrzeń 128-D — InfoNCE attraction/repulsion", font_size=22
         ).to_edge(UP, buff=0.3)
         self.play(FadeIn(section))
 
-        # Okrąg jednostkowy (L2-norm) — wszystkie punkty na nim
         sphere = Circle(radius=2.5, color=GREY, stroke_width=2).shift(DOWN * 0.3)
         sphere_lab = Text("|z| = 1  (L2-normalised)", font_size=16, color=GREY).next_to(
             sphere, UP, buff=0.1
         )
         self.play(Create(sphere), FadeIn(sphere_lab))
 
-        # Początkowe (losowe) pozycje text i signal — przed treningiem
         rng = np.random.default_rng(0)
         radius = 2.5
         text_init_angles = rng.uniform(0, 2 * np.pi, BATCH)
         sig_init_angles = rng.uniform(0, 2 * np.pi, BATCH)
 
-        # Po treningu: text_i i sig_i powinny być blisko siebie (positive pairs)
         target_angles = np.array([0.4, 1.9, 3.4, 5.1])  # arbitrary placement
 
         def angle_to_point(theta: float, r: float, center: np.ndarray) -> np.ndarray:
@@ -260,7 +249,6 @@ class TwoTowerInfoNCE(Scene):
         self.play(FadeIn(before_lab))
         self.wait(1.0)
 
-        # Animacja: text_i i sig_i zbiegają się do tego samego kąta (positive pair attraction)
         new_text_targets = [
             angle_to_point(target_angles[i] - 0.10, radius, center) for i in range(BATCH)
         ]
@@ -289,7 +277,6 @@ class TwoTowerInfoNCE(Scene):
         self.play(*anims, Transform(before_lab, after_lab), run_time=2.5)
         self.wait(0.7)
 
-        # Zaznaczenie positive pair connection (zielone linie pomiędzy t_i — s_i)
         pos_lines = VGroup(
             *[
                 Line(
@@ -304,7 +291,6 @@ class TwoTowerInfoNCE(Scene):
         self.play(Create(pos_lines), FadeIn(pos_caption))
         self.wait(1.0)
 
-        # Negatywne (czerwone) — wszystkie t_i ↔ s_j gdzie i ≠ j
         neg_lines = VGroup()
         for i in range(BATCH):
             for j in range(BATCH):
@@ -344,7 +330,6 @@ class TwoTowerInfoNCE(Scene):
             )
         )
 
-    # -----------------------------------------------------------------------
     def _scene_similarity_matrix(self) -> None:
         section = Text("Krok 3: Macierz podobieństw NxN — przekątna świeci", font_size=22).to_edge(
             UP, buff=0.3
@@ -356,7 +341,6 @@ class TwoTowerInfoNCE(Scene):
         grid_w = N * cell_size
         origin = np.array([-grid_w / 2 + cell_size / 2, grid_w / 2 - cell_size / 2, 0.0])
 
-        # Pre-training: macierz hałaśliwa (jednorodna ~0.5)
         before_vals = np.array(
             [
                 [0.55, 0.45, 0.50, 0.48],
@@ -365,7 +349,6 @@ class TwoTowerInfoNCE(Scene):
                 [0.51, 0.48, 0.47, 0.53],
             ]
         )
-        # After training: przekątna ~0.95, off-diag ~0.05
         after_vals = np.array(
             [
                 [0.95, 0.08, 0.10, 0.05],
@@ -390,7 +373,6 @@ class TwoTowerInfoNCE(Scene):
                 cells.add(rect)
             cell_objs.append(row)
 
-        # Etykiety osi
         col_labels = VGroup(
             *[
                 Text(f"s_{j}", font_size=18).move_to(
@@ -408,7 +390,6 @@ class TwoTowerInfoNCE(Scene):
             ]
         )
 
-        # Wartości w komórkach
         before_texts = VGroup(
             *[
                 Text(f"{before_vals[i, j]:.2f}", font_size=14, color=WHITE).move_to(
@@ -442,7 +423,6 @@ class TwoTowerInfoNCE(Scene):
             color=YELLOW,
         ).to_edge(DOWN, buff=0.6)
 
-        # Tekst wartości też update
         after_texts = VGroup(
             *[
                 Text(

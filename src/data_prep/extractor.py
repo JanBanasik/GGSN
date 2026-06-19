@@ -1,3 +1,9 @@
+"""MIMIC-IV extraction: cohort, radiology notes, vitals/labs, note-signal pairs.
+
+Data roots default to ``data/raw/``; override with ``MIMIC_IV_ROOT`` and
+``MIMIC_IV_NOTE_ROOT``.
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,19 +13,6 @@ from pathlib import Path
 import polars as pl
 
 from src.data_prep.cleaner import filter_leakage_phrases
-
-# ---------------------------------------------------------------------------
-# Config – MIMIC-IV data roots (override with env vars — pendrive / another disk)
-# ---------------------------------------------------------------------------
-# Default: <repo>/data/raw/mimiciv/3.1 and …/mimic-iv-note/2.2
-# Override if needed:
-#   export MIMIC_IV_ROOT="/Volumes/MyDrive/mimiciv/3.1"
-#   export MIMIC_IV_NOTE_ROOT="/Volumes/MyDrive/mimic-iv-note/2.2"
-#
-# Expected layout under MIMIC_IV_ROOT:
-#   icu/icustays.csv.gz, icu/chartevents.csv.gz, hosp/admissions.csv.gz, hosp/labevents.csv.gz
-# Under MIMIC_IV_NOTE_ROOT:
-#   note/radiology.csv.gz
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,9 +45,7 @@ COHORT_PRESETS: dict[str, list[str] | None] = {
 }
 DEFAULT_COHORT = "all-icus"
 
-# ---------------------------------------------------------------------------
 # Signal catalog – 7 vitals + 7 labs, mapped to a contiguous item_type_id
-# ---------------------------------------------------------------------------
 # Vitals (icu/chartevents). Mean values where multiple variants exist.
 VITALS_CATALOG: dict[str, list[int]] = {
     "HR": [220045],  # Heart Rate
@@ -112,9 +103,6 @@ NORM_RANGE: dict[str, tuple[float, float]] = {
 _DT_FMT = "%Y-%m-%d %H:%M:%S"
 
 
-# ---------------------------------------------------------------------------
-# Step 1 – Cardio cohort + in-hospital mortality label
-# ---------------------------------------------------------------------------
 def load_cohort(cohort: str = DEFAULT_COHORT) -> pl.DataFrame:
     """
     Loads ICU stays for the given cohort preset and joins in-hospital mortality
@@ -175,9 +163,6 @@ def load_cohort(cohort: str = DEFAULT_COHORT) -> pl.DataFrame:
     return cohort_df
 
 
-# ---------------------------------------------------------------------------
-# Step 2 – Radiology notes filtered to [intime, intime + 24 h]
-# ---------------------------------------------------------------------------
 def load_notes(cohort: pl.DataFrame) -> pl.DataFrame:
     """
     Reads radiology.csv.gz, keeps notes within [intime, intime + 24h] for the
@@ -207,9 +192,6 @@ def load_notes(cohort: pl.DataFrame) -> pl.DataFrame:
     return notes
 
 
-# ---------------------------------------------------------------------------
-# Step 3a – Vitals (chartevents)
-# ---------------------------------------------------------------------------
 def load_vitals(cohort: pl.DataFrame) -> pl.DataFrame:
     """
     Lazily scans chartevents.csv.gz for the configured vital itemids,
@@ -252,9 +234,6 @@ def load_vitals(cohort: pl.DataFrame) -> pl.DataFrame:
     return vitals
 
 
-# ---------------------------------------------------------------------------
-# Step 3b – Labs (labevents)
-# ---------------------------------------------------------------------------
 def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
     """
     Lazily scans labevents.csv.gz for the configured lab itemids, restricted
@@ -298,9 +277,6 @@ def load_labs(cohort: pl.DataFrame) -> pl.DataFrame:
     return labs
 
 
-# ---------------------------------------------------------------------------
-# Step 4 – Pair notes ↔ signals (note-level window or stay-level)
-# ---------------------------------------------------------------------------
 PAIR_STRATEGY_NOTE = "note_level"
 PAIR_STRATEGY_STAY = "stay_level"
 
@@ -394,9 +370,6 @@ def pair_notes_signals(
     return paired
 
 
-# ---------------------------------------------------------------------------
-# Step 5 – Full pipeline
-# ---------------------------------------------------------------------------
 def pairs_filename(cohort: str, pair_strategy: str) -> str:
     """Canonical CSV name per (cohort, strategy) so different runs don't overwrite."""
     return f"pairs_{cohort}_{pair_strategy}.csv"
@@ -460,7 +433,7 @@ def run_extraction(
     cohort_df = load_cohort(cohort)
     if toy:
         cohort_df = cohort_df.head(1000)
-        print(f"  [toy mode] trimmed to {len(cohort_df)} stays")
+        print(f"  Subset: {len(cohort_df)} stays")
 
     print("[2/5] Loading radiology notes (24 h window, with leakage filter)...")
     notes = load_notes(cohort_df)

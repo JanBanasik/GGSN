@@ -109,7 +109,6 @@ class SimilarityEvolution(Scene):
             vmin_g, vmax_g = float(all_vals.min()), float(all_vals.max())
             scales = [(vmin_g, vmax_g)] * len(matrices)
         vmin, vmax = scales[0]
-        # Legenda: pokaż globalny zakres dla referencji
         legend_vmin = min(s[0] for s in scales)
         legend_vmax = max(s[1] for s in scales)
 

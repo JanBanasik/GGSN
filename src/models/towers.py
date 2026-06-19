@@ -24,9 +24,6 @@ TYPE_EMBED_DIM = 8
 PAD_TYPE_ID = 0  # padding uses item_type_id=0 with value=0; mask handled implicitly
 
 
-# ---------------------------------------------------------------------------
-# Text Tower
-# ---------------------------------------------------------------------------
 class TextTower(nn.Module):
     """
     Bio_ClinicalBERT [CLS] → projection head → L2-normalised (B, embed_dim).
@@ -41,7 +38,6 @@ class TextTower(nn.Module):
         proj_dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        # Safetensors only: transformers+torch<2.6 cannot torch.load pytorch_model.bin (CVE-2025-32434 guard).
         self.bert = AutoModel.from_pretrained(model_name, use_safetensors=True)
         bert_hidden = self.bert.config.hidden_size  # 768 for BERT-base
 
@@ -71,9 +67,6 @@ class TextTower(nn.Module):
         return F.normalize(projected, dim=-1)
 
 
-# ---------------------------------------------------------------------------
-# Signal Tower
-# ---------------------------------------------------------------------------
 class SignalTower(nn.Module):
     """
     Encodes a sequence of (item_type_id, normalised_value, hours, delta) events.

@@ -4,9 +4,11 @@ version = "1.0.0"
 description = "Temporal GNN + Contrastive Learning for in-hospital mortality prediction on MIMIC-IV"
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [
+    { name = "Jan Banasik" },
+    { name = "Antoni Pater" },
+]
 dependencies = [
-    "ipykernel>=7.2.0",
-    "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     # PyTorch 2.2.x (Intel mac) — wheel vs NumPy 2.x → import torch się sypie.
     "numpy>=1.26.4,<2",
@@ -21,10 +23,16 @@ dependencies = [
     "torch-geometric>=2.7.0",
     "transformers>=4.46,<5; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "transformers>=5.5.4; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "python-pptx>=1.0.2",
 ]
 
 [project.optional-dependencies]
+notebook = [
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+]
+presentation = [
+    "python-pptx>=1.0.2",
+]
 # Manim wymaga numpy≥2.1 (koliduje z torch 2.2 + numpy<2 na Intel Mac) — animacje: osobne venv.
 viz = [
     "umap-learn>=0.5.12",
@@ -37,8 +45,9 @@ viz = [
 
 [dependency-groups]
 dev = [
-    "ruff>=0.7",
     "black>=24",
+    "pytest>=8.3",
+    "ruff>=0.7",
 ]
 
 [tool.ruff]
@@ -64,3 +73,7 @@ ignore = [
 line-length = 100
 target-version = ["py311"]
 extend-exclude = "/(notebooks|media)/"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

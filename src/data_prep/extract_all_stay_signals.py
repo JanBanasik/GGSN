@@ -1,5 +1,5 @@
 """
-Extract full ICU-stay signals (vitals + labs) for Enhancement #1.
+Extract full ICU-stay signals (vitals + labs) for Phase 2 GNN training.
 
 Current pipeline (extractor.py) only loads signals within [intime, intime+24h]
 because Phase 1 pairing pairs notes with nearby signals. The GNN (Phase 2) can

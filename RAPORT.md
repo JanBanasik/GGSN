@@ -378,16 +378,17 @@ uv run python -m src.training.train_gnn \
   --dropout 0.3
 ```
 
-Checkpoint: `data/snapshots/gnn/version_10/checkpoints/best.ckpt`
+Checkpoint z oryginalnego uruchomienia: `data/snapshots/gnn/version_10/checkpoints/best.ckpt`
 (re-run jako `version_14` z identyczną konfiguracją dał 0.848 / 0.468 — wynik
 stabilny między seedami przy `seed=42`, ale ~±0.002 AUROC szumu między runami).
+Checkpointy i logi nie są dystrybuowane w publicznym repozytorium.
 
 #### Reproducibility
 
 - `seed=42` we wszystkich eksperymentach (`np.random`, `torch`, `torch.cuda`)
 - Pełny suite ablacyjny: `bash run_experiments.sh`
-- Surowe metryki: `data/snapshots/gnn/version_{0..15}/metrics.csv`
-- Hyperparametry per run: `data/snapshots/gnn/version_*/hparams.yaml`
+- Lokalne surowe metryki: `data/snapshots/gnn/version_{0..15}/metrics.csv`
+- Lokalne hyperparametry per run: `data/snapshots/gnn/version_*/hparams.yaml`
 - Hardware: NVIDIA RTX 4060 Laptop (8GB VRAM); typowy run = 30-60 min
   (early stopping ~40 epok, batch=32 grafów)
 

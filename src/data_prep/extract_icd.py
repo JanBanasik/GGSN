@@ -31,9 +31,7 @@ import polars as pl
 
 from src.data_prep.extractor import MIMIC_BASE, PROCESSED_DIR, load_cohort
 
-# ---------------------------------------------------------------------------
 # Charlson comorbidity ICD-10 mapping (prefix-based, dots stripped)
-# ---------------------------------------------------------------------------
 # Each tuple: (column_name, [ICD-10 prefixes without dots, uppercase])
 # A code matches a category if it starts with ANY of the listed prefixes.
 CHARLSON_CATEGORIES: list[tuple[str, list[str]]] = [

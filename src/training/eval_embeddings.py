@@ -1,7 +1,7 @@
 """
 Evaluate embedding quality for the contrastive pre-training (Phase 1).
 
-Compares two checkpoints (default: epoch 0 vs best epoch) on the val split:
+Compares two checkpoints (by default epoch 0 vs epoch 16) on the val split:
   - Linear probe AUROC  (LogisticRegression, mortality label)
   - KMeans cluster purity (k=2)
   - Diagonal similarity gap
@@ -10,9 +10,8 @@ Compares two checkpoints (default: epoch 0 vs best epoch) on the val split:
 Also plots the val-loss learning curve with reference baselines.
 
 Usage:
-    uv run python -m src.training.eval_embeddings
     uv run python -m src.training.eval_embeddings \\
-        --run-dir data/snapshots/run_20260512_200632 \\
+        --run-dir data/snapshots/run_<timestamp> \\
         --epoch-a 0 --epoch-b 16 \\
         --out data/plots/embedding_comparison_v4.png
 """
@@ -37,9 +36,6 @@ from sklearn.preprocessing import StandardScaler
 BASELINE_LN64 = 4.1589  # ln(64) — effective batch 64
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def load_val_epoch(run_dir: Path, epoch: int) -> tuple[np.ndarray, np.ndarray]:
     """Load (X, y) for val set from a per-epoch snapshot."""
     folder = run_dir / f"epoch_{epoch:03d}"
@@ -95,7 +91,7 @@ def diagonal_gap(X: np.ndarray) -> float:
 
 
 def umap_2d(X: np.ndarray, y: np.ndarray, n_sample: int = 3000) -> tuple[np.ndarray, np.ndarray]:
-    import umap as umap_lib  # lazy import so the script loads fast without umap
+    import umap as umap_lib
 
     rng = np.random.default_rng(42)
     if len(X) > n_sample:
@@ -105,9 +101,6 @@ def umap_2d(X: np.ndarray, y: np.ndarray, n_sample: int = 3000) -> tuple[np.ndar
     return reducer.fit_transform(X), y
 
 
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
 def plot_comparison(
     run_dir: Path,
     epoch_a: int,
@@ -134,7 +127,6 @@ def plot_comparison(
     ax_umap_b = fig.add_subplot(gs[1, 1])
     ax_table = fig.add_subplot(gs[1, 2])
 
-    # --- Learning curve ---
     if log is not None:
         ax_curve.plot(log["epoch"], log["train_loss"], label="train", color="#4C72B0", lw=2)
         ax_curve.plot(log["epoch"], log["val_loss"], label="val", color="#DD8452", lw=2)
@@ -148,7 +140,6 @@ def plot_comparison(
         ax_curve.legend(fontsize=8)
         ax_curve.set_ylim(bottom=min(log["val_loss"].min() * 0.95, 2.2))
 
-    # --- AUROC bar ---
     auroc_vals = [metrics_a["auroc"], metrics_b["auroc"]]
     auroc_labels = [f"Epoch {epoch_a}\n(pre-training)", f"Epoch {epoch_b}\n(best)"]
     colors_auroc = ["#9ecae1", "#2171b5"]
@@ -169,7 +160,6 @@ def plot_comparison(
     ax_auroc.set_title("Linear Probe AUROC")
     ax_auroc.legend(fontsize=8)
 
-    # --- KMeans purity bar ---
     purity_vals = [metrics_a["purity"], metrics_b["purity"]]
     bars_p = ax_purity.bar(auroc_labels, purity_vals, color=colors_auroc, width=0.5)
     ax_purity.axhline(1 - 0.1246, ls=":", color="gray", lw=1, label="majority-class 0.875")
@@ -188,7 +178,6 @@ def plot_comparison(
     ax_purity.set_title("Cluster Purity")
     ax_purity.legend(fontsize=7)
 
-    # --- UMAP plots ---
     cmap = {0: "#4878D0", 1: "#EE854A"}
     for ax, (coords, lbls), ep in [(ax_umap_a, umap_a, epoch_a), (ax_umap_b, umap_b, epoch_b)]:
         for lbl, color in cmap.items():
@@ -207,7 +196,6 @@ def plot_comparison(
         ax.set_xticks([])
         ax.set_yticks([])
 
-    # --- Summary table ---
     ax_table.axis("off")
     table_data = [
         ["Metric", f"Ep. {epoch_a}", f"Ep. {epoch_b} (best)"],
@@ -233,9 +221,6 @@ def plot_comparison(
     print(f"\nSaved → {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir)
     epoch_a, epoch_b = args.epoch_a, args.epoch_b
@@ -313,9 +298,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate Phase 1 embedding quality")
     p.add_argument(
         "--run-dir",
-        default="data/snapshots/run_20260512_200632",
-        help="Path to the training run directory (must have epoch_XXX/ subdirs). "
-        "Default: canonical Phase 1 v4 run.",
+        required=True,
+        help="Path to a training run directory containing epoch_XXX/ subdirectories.",
     )
     p.add_argument(
         "--epoch-a", type=int, default=0, help="'Before' epoch (default: 0 = pre-training)"
@@ -329,7 +313,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out", default="data/plots/embedding_comparison_v4.png", help="Output PNG path"
     )
-    return p.parse_args()
+    args = p.parse_args()
+    run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        p.error(f"run directory does not exist: {run_dir}")
+    return args
 
 
 if __name__ == "__main__":
